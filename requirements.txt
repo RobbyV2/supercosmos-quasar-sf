@@ -1,0 +1,10 @@
+numpy==2.5.1
+scipy==1.18.0
+pandas==3.0.3
+pyarrow==25.0.1
+astropy==8.0.1
+h5py==3.16.0
+dust_extinction==1.7
+dustmaps==1.0.14
+PyMuPDF==1.28.2
+qsogen @ git+https://github.com/ywx649999311/qsogen@c7fb1d49b5673796092c57720e9d162532539959
