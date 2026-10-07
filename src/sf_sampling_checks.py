@@ -69,8 +69,7 @@ def signature(ids, n_draw):
     paths = [ROOT / esf.LC_PARQUET, ROOT / "data/detection_correction_components.parquet",
              ROOT / "data/plate_native_pair_variance.csv", ROOT / "data/plate_completeness_sample.parquet"]
     source = "".join(inspect.getsource(f) for f in (pair_values, split_accumulator, draw_single_pairs,
-                       esf.clean_nightly, esf.condense_nightly, esf.reject_outliers,
-                       esf.floor_variance, load_completeness_lightcurves))
+                                                    *esf.KERNELS, load_completeness_lightcurves))
     stamp = [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in paths]
     return hashlib.sha256(ids.astype("U").tobytes() + repr((stamp, n_draw)).encode() + source.encode()).hexdigest()
 

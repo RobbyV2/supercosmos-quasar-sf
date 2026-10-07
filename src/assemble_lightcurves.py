@@ -47,13 +47,15 @@ def abmag(w_obs, f_obs, wf, tf):
    return -2.5 * np.log10(num / den)
 
 
+def vac_to_air(w):
+   s2 = (1e4 / w) ** 2
+   return w / (1 + 8.34254e-5 + 0.02406147 / (130 - s2) + 0.00015998 / (38.9 - s2))
+
+
 def ab_minus_vega(wf, tf):
    # CALSPEC vacuum wavelengths -> air, as the passbands
    d = fits.getdata(_ROOT / "data/alpha_lyr_stis_012.fits", 1)
-   w = np.asarray(d["WAVELENGTH"], dtype=float)
-   s2 = (1e4 / w) ** 2
-   w = w / (1 + 8.34254e-5 + 0.02406147 / (130 - s2) + 0.00015998 / (38.9 - s2))
-   return abmag(w, np.asarray(d["FLUX"], dtype=float),
+   return abmag(vac_to_air(np.asarray(d["WAVELENGTH"], dtype=float)), np.asarray(d["FLUX"], dtype=float),
                 np.asarray(wf, dtype=float), np.asarray(tf, dtype=float))
 
 
@@ -781,7 +783,7 @@ def build_plate_zeropoints(det: pd.DataFrame, out_csv: str | None, min_stars: in
 
 IVEZIC_DAT = _ROOT / "data/stripe82calibStars_v4.2.dat"
 _IVEZIC_COLS = {"g": (13, 14, 16), "r": (19, 20, 22), "i": (25, 26, 28)}
-_FIELD_REF_BAND = {"SERC-J/EJ": "g", "SERC-R/AAO-R": "r", "SERC-I": "i", "POSSI-E(S)": "r"}
+SURVEY_SDSS_BAND = {"SERC-J/EJ": "g", "SERC-R/AAO-R": "r", "SERC-I": "i", "POSSI-E(S)": "r"}
 _FIELD_POS = {"const": 0, "plane": 2, "plane_radial": 3}
 FIELD_TERMS = ["fx", "fy", "frr", "fxy", "fxmy", "fx3", "fx2y", "fxy2", "fy3"]
 FIELD_COEF = ["fx", "fy", "frr", "fmean", "xi_lo", "xi_hi", "eta_lo", "eta_hi"]
@@ -989,7 +991,7 @@ def build_plate_detection_limits(det: pd.DataFrame, zp: pd.DataFrame) -> pd.Data
          continue
       r = z.loc[pl]
       sv = str(r["survey"]).strip()
-      ref = mags.get(_FIELD_REF_BAND.get(sv))
+      ref = mags.get(SURVEY_SDSS_BAND.get(sv))
       if ref is None or not np.isfinite(r["xi_lo"]):
          continue
       xi, eta = field_coords(np.full(npos, pl, dtype=np.int64), pos[:, 0], pos[:, 1])
@@ -1039,7 +1041,7 @@ def build_plate_field_surface(det: pd.DataFrame, zp: pd.DataFrame,
       raise ValueError("star index exceeds hdf5 key count")
    sv = det["SURVEYNAME"].astype(str).str.strip().to_numpy()
    ref = np.full(len(det), np.nan)
-   for name, b in _FIELD_REF_BAND.items():
+   for name, b in SURVEY_SDSS_BAND.items():
       m = sv == name
       ref[m] = mags[b][st[m]]
    plate = det["plate"].to_numpy().astype(np.int64)

@@ -354,8 +354,7 @@ def candidate_accumulator():
             raise ValueError("incomplete object accumulator")
         signature = str(f["signature"])
     sources = ["data/detection_correction_components.parquet", "data/plate_native_pair_variance.csv"]
-    kernels = [esf.accumulate, esf.clean_nightly, esf.condense_nightly, esf.reject_outliers,
-               esf.floor_variance, load_completeness_lightcurves]
+    kernels = [*esf.KERNELS, load_completeness_lightcurves]
     stamp = (ROOT / esf.LC_PARQUET).stat()
     code = "".join(inspect.getsource(f) for f in kernels)+f"{stamp.st_size}:{stamp.st_mtime_ns}"
     expected = hashlib.sha256(b"".join((ROOT/p).read_bytes() for p in sources)

@@ -417,8 +417,7 @@ def object_first_results():
     z,lum=cats.z.to_numpy(float),cats.loglbol.to_numpy(float)
     zmap=pd.Series(z,index=ids)
     sources=['data/detection_correction_components.parquet','data/plate_native_pair_variance.csv']
-    kernels=[accumulate,esf.clean_nightly,esf.condense_nightly,esf.reject_outliers,esf.floor_variance,
-             load_completeness_lightcurves]
+    kernels=[*esf.KERNELS,load_completeness_lightcurves]
     stamp=(_ROOT/esf.LC_PARQUET).stat()
     code=''.join(inspect.getsource(f) for f in kernels)+f'{stamp.st_size}:{stamp.st_mtime_ns}'
     signature=hashlib.sha256(b''.join((_ROOT/p).read_bytes() for p in sources)+ids.astype('U').tobytes()+code.encode()).hexdigest()

@@ -10,7 +10,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 from qsogen import model_colours as mc
-from assemble_lightcurves import ab_minus_vega, abmag, read_bandpass
+from assemble_lightcurves import ab_minus_vega, abmag, read_bandpass, vac_to_air
 import ensemble_structure_function as esf
 
 SSS_FILTERS = {
@@ -41,8 +41,7 @@ def _native_sed_row(args):
         use = (w >= 2000) & (w <= 33000)
         w, f = w[use], f[use]
         f = redden(w, f, foreground)
-        s2 = (1e4 / w) ** 2
-        w = w / (1 + 8.34254e-5 + .02406147 / (130 - s2) + .00015998 / (38.9 - s2))
+        w = vac_to_air(w)
         mags = {b: abmag(w, f, *bp) for b, bp in bands.items()}
         terms.append([mags["g" if b == "bj" else "r_sdss"] - mags[b] + vega[b]
                       - (0 if b == "bj" else .015) for b in ("bj", "r", "e", "tp")])
@@ -107,8 +106,7 @@ def observed_sed_control(manifest_path=None, output=None):
                         for key in ['RUN2D', 'LAMBDA_EFF', 'BOSS_TARGET1', 'ANCILLARY_TARGET1',
                                     'ANCILLARY_TARGET2', 'EBOSS_TARGET0', 'EBOSS_TARGET1', 'EBOSS_TARGET2']
                         if key in info.names}
-        s2 = (1e4 / w) ** 2
-        w /= 1 + 8.34254e-5 + .02406147 / (130 - s2) + .00015998 / (38.9 - s2)
+        w = vac_to_air(w)
         good = np.isfinite(f) & np.isfinite(iv) & (iv > 0)
         flux = np.interp(w, w[good], f[good])
         variance = np.divide(1, iv, out=np.zeros(len(iv)), where=good)

@@ -272,8 +272,7 @@ def native_quasars():
         w=wave*(1+p.z);use=(w>=2000)&(w<=33000)
         w=w[use]
         f=redden(w,flux[use]/(1+p.z),p.ebv)
-        s2=(1e4/w)**2
-        w=w/(1+8.34254e-5+.02406147/(130-s2)+.00015998/(38.9-s2))
+        w=al.vac_to_air(w)
         mags={b:al.abmag(w,f,*bp) for b,bp in bands.items()}
         terms.append(dict(OBJID=obj,ebv=p.ebv,
                           bj=mags["sdss_g"]-mags["bj"]+vega["bj"],
@@ -336,7 +335,6 @@ def native_validation():
 
 
 def native_noise():
-    from itertools import combinations
     from scipy.optimize import nnls
     stars,det=native_inputs()
     coefficients=pd.read_csv(NATIVE_WORK/"coefficients.csv").set_index("plate")
@@ -363,12 +361,7 @@ def native_noise():
     epochs=pd.concat(rows,ignore_index=True)
     epochs.to_parquet(NATIVE_WORK/"star_epochs.parquet",index=False)
     e=epochs.sort_values(["star","band"],kind="stable").reset_index(drop=True)
-    key=e.star.to_numpy()*2+e.band.eq("r").to_numpy()
-    starts=np.flatnonzero(np.r_[True,np.diff(key)!=0]);sizes=np.diff(np.r_[starts,len(e)])
-    ii,jj=[],[]
-    for a,b in combinations(range(int(sizes.max())),2):
-        s=starts[sizes>b];ii.append(s+a);jj.append(s+b)
-    i,j=np.concatenate(ii),np.concatenate(jj)
+    i,j=esf.group_pairs(e.star.to_numpy()*2+e.band.eq("r").to_numpy())
     code=e.native.map({"bj":0,"r":1,"e":2,"tp":3}).to_numpy()*100+np.floor(e.expected.to_numpy()*2).astype(int)
     pairs=pd.DataFrame(dict(star=e.star.to_numpy()[i],fold=e.fold.to_numpy()[i],
         a=np.minimum(code[i],code[j]),b=np.maximum(code[i],code[j]),
@@ -418,11 +411,7 @@ def native_noise():
     ccd=e.drop_duplicates(["star","band"]).copy()
     ccd["native"],ccd["residual"],ccd["s2"],ccd["boundary_sigma"]="ccd",0.,ccd.reference_variance,np.inf
     e=pd.concat([e,ccd],ignore_index=True).sort_values(["star","band"],kind="stable").reset_index(drop=True)
-    key=e.star.to_numpy()*2+e.band.eq("r").to_numpy();starts=np.flatnonzero(np.r_[True,np.diff(key)!=0]);sizes=np.diff(np.r_[starts,len(e)])
-    ii,jj=[],[]
-    for a,b in combinations(range(int(sizes.max())),2):
-        s=starts[sizes>b];ii.append(s+a);jj.append(s+b)
-    i,j=np.concatenate(ii),np.concatenate(jj)
+    i,j=esf.group_pairs(e.star.to_numpy()*2+e.band.eq("r").to_numpy())
     code=e.native.map({"ccd":0,"bj":1,"r":2,"e":3,"tp":4}).to_numpy()
     pairs=pd.DataFrame(dict(star=e.star.to_numpy()[i],fold=e.fold.to_numpy()[i],band=e.band.to_numpy()[i],
         a=np.minimum(code[i],code[j]),b=np.maximum(code[i],code[j]),mag=e.reference.to_numpy()[i],
@@ -518,7 +507,6 @@ def native_longform(radius=1.0,sat_cut=True):
 
 
 def native_null():
-    from itertools import combinations
     from scipy.sparse import coo_matrix
     e=pd.read_parquet(NATIVE_WORK/"star_epochs.parquet")
     e=e[e.fold.eq(4)&e.boundary_sigma.ge(3)].copy()
@@ -531,12 +519,7 @@ def native_null():
     ccd=e.drop_duplicates(["star","band"]).copy()
     ccd["native"],ccd["residual"],ccd["s2"],ccd["mjd"],ccd["plate"]="ccd",0.,ccd.reference_variance,sn.CCD_MJD,-1
     e=pd.concat([e,ccd],ignore_index=True).sort_values(["star","band"],kind="stable").reset_index(drop=True)
-    key=e.star.to_numpy()*2+e.band.eq("r").to_numpy()
-    starts=np.flatnonzero(np.r_[True,np.diff(key)!=0]);sizes=np.diff(np.r_[starts,len(e)])
-    ii,jj=[],[]
-    for a,b in combinations(range(int(sizes.max())),2):
-        s=starts[sizes>b];ii.append(s+a);jj.append(s+b)
-    i,j=np.concatenate(ii),np.concatenate(jj)
+    i,j=esf.group_pairs(e.star.to_numpy()*2+e.band.eq("r").to_numpy())
     code=e.native.map({"ccd":0,"bj":1,"r":2,"e":3,"tp":4}).to_numpy()
     p=pd.DataFrame(dict(star=e.star.to_numpy()[i],band=e.band.to_numpy()[i],
         a=np.minimum(code[i],code[j]),b=np.maximum(code[i],code[j]),mag=e.reference.to_numpy()[i],

@@ -227,6 +227,17 @@ def influence(a,prop):
     return out
 
 
+def greedy(a,kernel,stat,steps=2,key=lambda s:s):
+    keep,path=np.ones(len(a),bool),[(-1,stat(a,kernel))]
+    for _ in range(steps):
+        trial={i:stat(a[m],tuple(x[m] for x in kernel))
+               for i in np.flatnonzero(keep) for m in [keep&(np.arange(len(a))!=i)]}
+        i=min(trial,key=lambda i:key(trial[i]))
+        keep[i]=False
+        path.append((i,trial[i]))
+    return path
+
+
 def lowmass_influence():
     from plate_completeness import load_completeness_lightcurves
     groups,rows=['lowmbh_lowedd','lowmbh_highedd'],[]
@@ -234,21 +245,16 @@ def lowmass_influence():
         if name not in groups:
             continue
         ids=prop.index.to_numpy(str)
-        def endpoint(keep):
-            reps=np.sqrt(np.maximum(esf.object_bootstrap(a[keep],n_boot=3000,
+        def endpoint(a,kernel):
+            reps=np.sqrt(np.maximum(esf.object_bootstrap(a,n_boot=3000,
                                                          seed=3300+10*esf.BANDS.index(band)+groups.index(name))[1],0))
-            e=[r for r in fsf._object_fit(a[keep],reps,name,band,tuple(v[keep] for v in kernel))[0]
-               if r['model']=='drw_extrapolation'][-1]
+            e=[r for r in fsf._object_fit(a,reps,name,band,kernel)[0] if r['model']=='drw_extrapolation'][-1]
             return e['lag_center_days'],e['excess_mag'],e['excess_err_mag']
-        keep=np.ones(len(a),bool)
-        lag,x,e=endpoint(keep)
+        (_,(lag,x,e)),*drops=greedy(a,kernel,endpoint,key=lambda s:s[1]/s[2])
         row=dict(band=band,sample=name,n_objects=len(a),lag_center_days=lag,excess_mag=x,excess_err_mag=e,sigma=x/e)
-        for n in [1,2]:
-            trial={i:endpoint(keep&(np.arange(len(a))!=i))[1:] for i in np.flatnonzero(keep)}
-            i=min(trial,key=lambda i:trial[i][0]/trial[i][1])
-            keep[i]=False
-            row.update({f'drop{n}_objid':ids[i],f'drop{n}_excess_mag':trial[i][0],
-                        f'drop{n}_excess_err_mag':trial[i][1],f'drop{n}_sigma':trial[i][0]/trial[i][1]})
+        for n,(i,(_,dx,de)) in enumerate(drops,1):
+            row.update({f'drop{n}_objid':ids[i],f'drop{n}_excess_mag':dx,
+                        f'drop{n}_excess_err_mag':de,f'drop{n}_sigma':dx/de})
         nt=esf.clean_nightly(load_completeness_lightcurves(ids).query('band == @band'))[0]
         err,nplates,theta,active=fsf._object_plate_jackknife(nt,ids,prop.z,a,band)
         k=int(np.argmin(abs(fsf.CENTERS-lag)))
@@ -461,25 +467,22 @@ def fit_range():
 
 
 REJECT_SIGMA = (3., 4., 5., 7., 10., np.inf)
-SEGMENT = ['OBJID', 'band', 'survey']
 
 
 def deviations(nightly):
-    n = nightly.sort_values([*SEGMENT, 'night'], ignore_index=True)
-    g = n.groupby(SEGMENT, observed=True, sort=False)
-    n['res'] = n.mag-g.mag.transform('median')
-    mad = 1.4826*n.res.abs().groupby([n[c] for c in SEGMENT], observed=True, sort=False).transform('median')
-    err = g.sig.transform('median')
-    return n.assign(rob=np.maximum(mad, err), noisy=err >= mad, nseg=g.mag.transform('size'))
+    n = esf.segment_deviations(nightly).sort_values([*esf.SEGMENT, 'night'], ignore_index=True)
+    return n.assign(rob=np.maximum(n.mad, n.err), noisy=n.err >= n.mad,
+                    nseg=n.groupby(esf.SEGMENT, observed=True, sort=False).mag.transform('size'))
 
 
 def night_rows(n, sample):
     rows = []
     for (b, s), d in [*n.groupby(['band', 'survey']), *(((b, 'all'), d) for b, d in n.groupby('band'))]:
-        d = d.sort_values([*SEGMENT, 'night'])
-        res, rob, key = d.res.to_numpy(), d.rob.to_numpy(), (d.night+1e7*d.groupby(SEGMENT).ngroup()).to_numpy(float)
+        d = d.sort_values([*esf.SEGMENT, 'night'])
+        res, rob = d.res.to_numpy(), d.rob.to_numpy()
+        key = (d.night+1e7*d.groupby(esf.SEGMENT).ngroup()).to_numpy(float)
         night = d.night.to_numpy()
-        seg = d.drop_duplicates(SEGMENT)
+        seg = d.drop_duplicates(esf.SEGMENT)
         base = dict(sample=sample, band=b, survey=s, n_objects=d.OBJID.nunique(), n_nights=len(d),
                     segment_nights_median=seg.nseg.median(), nights_in_3plus_fraction=(d.nseg >= 3).mean(),
                     noise_dominated_segment_fraction=seg.noisy.mean(), max_abs_dev_sigma=np.abs(res/rob).max())
@@ -515,7 +518,7 @@ def rejection():
     prop, ref = cat.drop_duplicates('OBJID').set_index('OBJID'), cat.set_index(['band', 'OBJID']).reference_mag
     nightly = esf.condense_nightly(load_completeness_lightcurves(np.union1d(*ids.values())))
     q = deviations(nightly)
-    order = lambda x: x[list(nightly.columns)].sort_values([*SEGMENT, 'night'], ignore_index=True)
+    order = lambda x: x[list(nightly.columns)].sort_values([*esf.SEGMENT, 'night'], ignore_index=True)
     pd.testing.assert_frame_equal(order(esf.reject_outliers(nightly)[0]), order(q[np.abs(q.res) <= esf.CLIP_SIGMA*q.rob]))
     q = pd.concat([q[q.band.eq(b) & q.OBJID.isin(ids[b])] for b in esf.BANDS])
     mags = {b: ref[b].reindex(ids[b]) for b in esf.BANDS}

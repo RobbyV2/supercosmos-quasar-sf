@@ -1,3 +1,4 @@
+from itertools import combinations
 from pathlib import Path
 from typing import Literal
 import ast
@@ -17,6 +18,7 @@ NB = len(EDGES) - 1
 # Hartlap factor 0.998 here (0.920 at 200); own generator keeps 200-draw error bars fixed
 N_COV_BOOT = 10000
 CLIP_SIGMA = 5.0
+SEGMENT = ["OBJID", "band", "survey"]
 QVC_REJECT = False
 QVC_HALF_WINDOW = 30.0
 QVC_MIN_NEIGHBORS = 8
@@ -66,19 +68,17 @@ def condense_nightly(df: pd.DataFrame) -> pd.DataFrame:
                             "calib_ok", "trunc_v"]]
 
 
+def segment_deviations(nightly: pd.DataFrame) -> pd.DataFrame:
+    g = nightly.groupby(SEGMENT, observed=True, sort=False)
+    res = nightly["mag"] - g["mag"].transform("median")
+    mad = 1.4826 * res.abs().groupby([nightly[c] for c in SEGMENT], observed=True, sort=False).transform("median")
+    return nightly.assign(res=res, mad=mad, err=g["sig"].transform("median"))
+
+
 def reject_outliers(nightly: pd.DataFrame) -> tuple[pd.DataFrame, int, int, int]:
-    keys = ["OBJID", "band", "survey"]
-    st = nightly.groupby(keys, observed=True).agg(med=("mag", "median"), mederr=("sig", "median"))
-    df = nightly.merge(st, left_on=keys, right_index=True)
-    df["resid"] = df["mag"] - df["med"]
-    mad = df.assign(absr=df["resid"].abs()).groupby(keys, observed=True)["absr"].median().rename("mad")
-    df = df.merge(mad, left_on=keys, right_index=True)
-    sig_seg = np.maximum(1.4826 * df["mad"].to_numpy(), df["mederr"].to_numpy())
-    keep = np.abs(df["resid"].to_numpy()) <= CLIP_SIGMA * sig_seg
-    keep |= df["sss"].to_numpy(bool)
-    n_rej = int((~keep).sum())
-    n_rej_sss = int((~keep & df["sss"].to_numpy(dtype=bool)).sum())
-    return df.loc[keep, list(nightly.columns)], n_rej, len(df), n_rej_sss
+    d, sss = segment_deviations(nightly), nightly["sss"].to_numpy(bool)
+    keep = (np.abs(d["res"].to_numpy()) <= CLIP_SIGMA * np.maximum(d["mad"].to_numpy(), d["err"].to_numpy())) | sss
+    return nightly.loc[keep], int((~keep).sum()), len(nightly), int((~keep & sss).sum())
 
 
 def qvc_significance(nightly: pd.DataFrame) -> np.ndarray:
@@ -159,6 +159,13 @@ def floor_variance(nightly: pd.DataFrame, col: str = "sf2_mag2") -> pd.DataFrame
     return pd.DataFrame(out, columns=FV_COLS, index=nightly.index).assign(pcode=code)
 
 
+def group_pairs(key: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+    sizes = np.diff(np.r_[starts, len(key)])
+    i, j = zip(*[(s + a, s + b) for a, b in combinations(range(int(sizes.max())), 2) for s in [starts[sizes > b]]])
+    return np.concatenate(i), np.concatenate(j)
+
+
 def accumulate(nightly: pd.DataFrame, objids: np.ndarray, zmap: pd.Series,
                edges: np.ndarray = EDGES, plate_acc: np.ndarray | None = None,
                plate_pos: dict[int, int] | None = None,
@@ -214,6 +221,9 @@ def accumulate(nightly: pd.DataFrame, objids: np.ndarray, zmap: pd.Series,
                 np.add.at(plate_acc[:, bi, :, 1], (c[msk], idx[msk]), dm2[msk])
                 np.add.at(plate_acc[:, bi, :, 2], (c[msk], idx[msk]), se2[msk])
     return acc
+
+
+KERNELS = (accumulate, clean_nightly, condense_nightly, segment_deviations, reject_outliers, floor_variance)
 
 
 SFMethod = Literal["object_mean", "object_median", "positive_median", "amplitude_mean", "pooled"]

@@ -1,5 +1,4 @@
 import sys
-from itertools import combinations
 from pathlib import Path
 from typing import NamedTuple
 
@@ -11,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ensemble_structure_function as esf
 from assemble_lightcurves import (plate_ccd_tie, build_plate_zeropoints, ivezic_star_mags,
                                   plate_zp_offset, star_zp_detections,
-                                  truncation_curve,
+                                  SURVEY_SDSS_BAND, truncation_curve,
                                   truncation_offset, truncation_variance)
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -41,8 +40,6 @@ MAG_EDGES = np.arange(14.0, 22.51, 0.5)
 MAG_CEN = 0.5 * (MAG_EDGES[:-1] + MAG_EDGES[1:])
 CEDGES = np.arange(-0.5, 2.51, 0.1)
 CCEN = 0.5 * (CEDGES[:-1] + CEDGES[1:])
-SURVEY_SDSS_BAND = {"SERC-J/EJ": "g", "SERC-R/AAO-R": "r", "POSSI-E(S)": "r",
-                    "SERC-I": "i"}
 
 
 def _ivezic_star_mags() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
@@ -75,7 +72,6 @@ def _color_transform(d0: np.ndarray, col: np.ndarray, ccd: np.ndarray,
 
 
 PAIR_SURVEYS = ["CCD", "SERC-J/EJ", "SERC-R/AAO-R", "POSSI-E(S)", "SERC-I"]
-PAIR_BAND = {"SERC-J/EJ": "g", "SERC-R/AAO-R": "r", "POSSI-E(S)": "r", "SERC-I": "i"}
 RESID_CSV = _ROOT / "data/plate_pair_residual_variance.csv"
 NULL_MAG = np.array([17.5, 19.0, 20.5, 22.0])
 NULL_LAG = np.logspace(1.0, 4.5, 11)
@@ -133,7 +129,7 @@ def _null_epochs(remove_dropout: bool = True) -> tuple[pd.DataFrame, np.ndarray]
     df, res, ccd, ce2, sv = star_residuals(remove_dropout)
     v = truncation_variance(sv, df["plate"], df["ra"], df["dec"], ccd, truncation_curve(),
                             pd.read_csv(_ROOT / "data/sss_plate_zeropoints.csv"))
-    e = pd.DataFrame(dict(star=df["star"].to_numpy(), band=pd.Series(sv).map(PAIR_BAND).to_numpy(),
+    e = pd.DataFrame(dict(star=df["star"].to_numpy(), band=pd.Series(sv).map(SURVEY_SDSS_BAND).to_numpy(),
                           code=pd.Series(sv).map(PAIR_SURVEYS.index).to_numpy(),
                           res=res - plate_ccd_tie(df["plate"], ccd), s2=df["SMAG_ERR"].to_numpy(float) ** 2,
                           v=np.ones(len(df)) if remove_dropout else v, mjd=df["mjd"].to_numpy(),
@@ -147,15 +143,7 @@ def _null_pairs(e: pd.DataFrame, limits: pd.DataFrame | None, nsig: float = CLIP
     e = e[np.isfinite(e.res) & np.isfinite(e.ccd)]
     c = e.drop_duplicates(["star", "band"]).assign(code=0, res=0.0, v=1.0, mjd=CCD_MJD, plate=-1)
     e = pd.concat([e, c.assign(s2=c.ce2)]).sort_values(["star", "band"], kind="stable")
-    key = e.star.to_numpy() * 3 + e.band.map({"g": 0, "r": 1, "i": 2}).to_numpy()
-    starts = np.flatnonzero(np.r_[True, np.diff(key) != 0])
-    sizes = np.diff(np.r_[starts, len(e)])
-    ii, jj = [], []
-    for a, b in combinations(range(int(sizes.max())), 2):
-        s = starts[sizes > b]
-        ii.append(s + a)
-        jj.append(s + b)
-    i, j = np.concatenate(ii), np.concatenate(jj)
+    i, j = esf.group_pairs(e.star.to_numpy() * 3 + e.band.map({"g": 0, "r": 1, "i": 2}).to_numpy())
     col = lambda k: e[k].to_numpy()
     code, pl = col("code"), col("plate")
     ca, cb = np.minimum(code[i], code[j]), np.maximum(code[i], code[j])
@@ -249,7 +237,7 @@ def _null_tables(P: NullPairs, keep: np.ndarray, min_pairs: int = MIN_PAIRS, u: 
         cl, mk = divmod(k, nm)
         sa, sb = PAIR_SURVEYS[cl // len(PAIR_SURVEYS)], PAIR_SURVEYS[cl % len(PAIR_SURVEYS)]
         th = FJ[usedt[:, k], k]
-        rows.append(dict(survey_a=sa, survey_b=sb, band=PAIR_BAND[sb], mag_lo=MAG_EDGES[mk],
+        rows.append(dict(survey_a=sa, survey_b=sb, band=SURVEY_SDSS_BAND[sb], mag_lo=MAG_EDGES[mk],
                          mag_hi=MAG_EDGES[mk + 1], sf2_mag2=FT[k],
                          sf2_jack_err=float(np.sqrt((len(th) - 1) / len(th) * np.sum((th - th.mean()) ** 2))),
                          n_pairs=int(NT[k]), n_plates=len(th)))
