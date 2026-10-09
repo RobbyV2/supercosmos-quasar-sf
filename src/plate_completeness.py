@@ -9,11 +9,10 @@ from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.table import Table
 from scipy.spatial import cKDTree
-from scipy.stats import norm
 
 from assemble_lightcurves import (
     _pava_decreasing, ccd_reference_mags, ccd_truncation_curve, field_coords,
-    plate_centres, truncation_curve, sss_raw, assign_group_ids_by_sky, match_groups_to_catalog,
+    plate_centres, sss_raw, assign_group_ids_by_sky, match_groups_to_catalog, redshifts,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +24,8 @@ ADOPTED_SELECTION = {"g": "all_cut_025", "r": "all_cut_025"}
 BRIGHT_BOUND = 17.5
 BLAZAR_RADIUS = 2.0
 INSET = 0.02
+MAX_DZ = 0.2
+DIAGNOSIS = ("all_nocut", "all_lim050", "all_cut_000", "all_cut_025", "all_cut_100", "all_lim095")
 
 
 def blazars(cat):
@@ -32,7 +33,7 @@ def blazars(cat):
     sky = SkyCoord(15*(bz.RAh+bz.RAm/60+bz.RAs/3600), np.where(bz["DE-"] == "-", -1, 1)*(bz.DEd+bz.DEm/60+bz.DEs/3600), unit="deg")
     i, sep, _ = SkyCoord(cat.RA, cat.DEC, unit="deg").match_to_catalog_sky(sky)
     m = sep.arcsec <= BLAZAR_RADIUS
-    out = pd.DataFrame({"OBJID": cat.objectId[m].astype(str), "z": cat.Z_DR16Q[m], "bzcat_name": bz.Name.to_numpy()[i[m]],
+    out = pd.DataFrame({"OBJID": cat.objectId[m].astype(str), "z": cat.z[m], "bzcat_name": bz.Name.to_numpy()[i[m]],
                         "bzcat_class": bz.Class.to_numpy()[i[m]], "bzcat_z": bz.z.to_numpy()[i[m]], "separation_arcsec": sep.arcsec[m]})
     out.to_csv(DATA / "bzcat5_stripe82_matches.csv", index=False)
     return out
@@ -40,13 +41,15 @@ def blazars(cat):
 
 def catalog():
     cat = pd.read_parquet(DATA / "S82/Catalog.parquet")
+    cat["z"] = redshifts()[cat.objectId.astype(str)].to_numpy()
     cat = cat[~cat.objectId.astype(str).isin(blazars(cat).OBJID)]
     cat["OBJID"] = cat["objectId"].astype(str)
     cat["query_key"] = [f"{ra:.6f}_{dec:.6f}" for ra, dec in zip(cat.RA, cat.DEC)]
+    cat["redshift_mismatch"] = (cat.z - cat.Z_DR16Q).abs() >= MAX_DZ
     with fits.open(DATA / "dr16q_prop_May01_2024.fits", memmap=True) as h:
         d = h[1].data
         prop = pd.DataFrame({n: d[n].astype(np.int64) for n in ("PLATE", "MJD", "FIBERID")}
-                            | {n: d[n].astype(float) for n in ("RA", "DEC", "Z_DR16Q", "LOGLBOL")})
+                            | {n: d[n].astype(float) for n in ("RA", "DEC", "LOGLBOL")})
     return cat.merge(prop[["PLATE", "MJD", "FIBERID", "LOGLBOL"]],
                      on=["PLATE", "MJD", "FIBERID"], validate="one_to_one"), prop
 
@@ -98,7 +101,7 @@ def opportunities(cat, prop, ref, plates):
         obj = cat.OBJID.iloc[k].to_numpy()
         rows.append(pd.DataFrame({"OBJID": obj, "plate": p.plate, "series": p.survey,
                                   "band": SERIES[p.survey], "reference_mag": ref[SERIES[p.survey]].iloc[k].to_numpy(),
-                                  "z": cat.Z_DR16Q.iloc[k].to_numpy(), "edge_distance_deg": edge,
+                                  "z": cat.z.iloc[k].to_numpy(), "edge_distance_deg": edge,
                                   "interior": edge >= INSET, "archive_detection": np.isfinite(sep),
                                   "matched_1arcsec": [(o, p.plate) in matched for o in obj],
                                   "individual_within_1arcsec": sep <= 1, "separation_arcsec": sep,
@@ -171,18 +174,20 @@ def sample_tables(cat, stats, ref, opp):
     interior = opp[opp.interior]
     for band in "gr":
         mag, inside, detected, values = band_statistics(cat, stats, ref, interior, band)
-        target = cat.Z_DR16Q.to_numpy() >= 0.5
+        target = cat.z.to_numpy() >= 0.5
         sv = PRIMARY[band]
         out = pd.DataFrame({"OBJID": cat.OBJID, "band": band, "reference_mag": mag,
-                            "z": cat.Z_DR16Q, "loglbol": cat.LOGLBOL,
+                            "z": cat.z, "loglbol": cat.LOGLBOL, "redshift_mismatch": cat.redshift_mismatch,
                             "plate_opportunity": inside, "plate_detected": detected})
-        limits = []
+        limits, limits50, limits95 = [], [], []
         for name, (value, valid) in values.items():
             if name != sv:
                 out[f"{name}_epoch_ratio"] = value
             a, monotone, limit = binned_curve(mag, value, target & valid)
             limits.append(limit)
-            levels.append(dict(band=band, survey=name, limit90=limit,
+            limits50.append(binned_curve(mag, value, target & valid, level=0.5)[2])
+            limits95.append(binned_curve(mag, value, target & valid, level=0.95)[2])
+            levels.append(dict(band=band, survey=name, limit90=limit, limit50=limits50[-1], limit95=limits95[-1],
                                kind="plate_object_recovery" if name == sv else "ccd_local_epoch_ratio"))
             recovery = np.interp(mag, a[:, 0], monotone)
             if name == sv:
@@ -191,18 +196,22 @@ def sample_tables(cat, stats, ref, opp):
                 curves.append(dict(band=band, survey=name, mag_center=row[0], n_objects=int(row[1]),
                                    recovery=row[2], recovery_err=row[3], monotone_recovery=fitted,
                                    limit90=limit, kind=levels[-1]["kind"], stage="kept_epoch"))
-        for margin in MARGINS:
-            tag = f"{int(100*margin):03d}"
-            for kind, limit in [("plate", limits[0]), ("all", min(limits))]:
-                keep = inside & target & (mag >= BRIGHT_BOUND) & (mag <= limit-margin)
-                out[f"{kind}_cut_{tag}"] = keep
-                row = dict(band=band, selection=f"{kind}_cut_{tag}", margin_mag=margin,
-                           mag_min=BRIGHT_BOUND, mag_max=limit-margin, n_parent=int(keep.sum()),
-                           n_detected=int(detected[keep].sum()), recovery=float(detected[keep].mean()),
-                           median_z=float(cat.Z_DR16Q[keep].median()), median_loglbol=float(cat.LOGLBOL[keep].median()))
-                for survey in ("sdss", "ps1", "ztf"):
-                    row[f"{survey}_epoch_ratio"] = out.loc[keep, f"{survey}_epoch_ratio"].mean()
-                sweep.append(row)
+        cuts = [(f"{kind}_cut_{int(100*margin):03d}", margin, limit-margin) for margin in MARGINS
+                for kind, limit in [("plate", limits[0]), ("all", min(limits))]]
+        for name, margin, faint in cuts + [("all_nocut", np.nan, np.inf), ("all_lim050", np.nan, min(limits50)),
+                                           ("all_cut_000", 0.0, min(limits)), ("all_lim095", np.nan, min(limits95))]:
+            keep = inside & target & (mag >= BRIGHT_BOUND) & (mag <= faint)
+            if name == ADOPTED_SELECTION[band]:
+                out["magnitude_selected"] = keep
+            keep = keep & ~cat.redshift_mismatch.to_numpy()
+            out[name] = keep
+            row = dict(band=band, selection=name, margin_mag=margin,
+                       mag_min=BRIGHT_BOUND, mag_max=faint, n_parent=int(keep.sum()),
+                       n_detected=int(detected[keep].sum()), recovery=float(detected[keep].mean()),
+                       median_z=float(cat.z[keep].median()), median_loglbol=float(cat.LOGLBOL[keep].median()))
+            for survey in ("sdss", "ps1", "ztf"):
+                row[f"{survey}_epoch_ratio"] = out.loc[keep, f"{survey}_epoch_ratio"].mean()
+            sweep.append(row)
         out["plate_limit90"], out["ccd_limit90"] = limits[0], min(limits[1:])
         out["adopted_keep"] = False
         all_rows.append(out)
@@ -343,9 +352,21 @@ def _property_weights(features, cells, selected, counts, target, theta=None):
     return weight, fit.x, error
 
 
-def candidate_accumulator():
+def accumulator_signature(ids):
     import hashlib
     import inspect
+    import ensemble_structure_function as esf
+
+    h = hashlib.sha256()
+    for p in [esf.LC_PARQUET, "data/detection_correction_components.parquet", "data/plate_native_pair_variance.csv"]:
+        h.update(esf.digest(ROOT / p).encode())
+    h.update(ids.astype("U").tobytes())
+    h.update(redshifts()[ids].to_numpy().tobytes())
+    h.update("".join(inspect.getsource(f) for f in [*esf.KERNELS, load_completeness_lightcurves]).encode())
+    return h.hexdigest()
+
+
+def candidate_accumulator():
     import ensemble_structure_function as esf
 
     with np.load(esf.CACHE / "object_first/object_accumulator.npz") as f:
@@ -353,13 +374,7 @@ def candidate_accumulator():
         if int(f["completed"]) != len(ids):
             raise ValueError("incomplete object accumulator")
         signature = str(f["signature"])
-    sources = ["data/detection_correction_components.parquet", "data/plate_native_pair_variance.csv"]
-    kernels = [*esf.KERNELS, load_completeness_lightcurves]
-    stamp = (ROOT / esf.LC_PARQUET).stat()
-    code = "".join(inspect.getsource(f) for f in kernels)+f"{stamp.st_size}:{stamp.st_mtime_ns}"
-    expected = hashlib.sha256(b"".join((ROOT/p).read_bytes() for p in sources)
-                              +ids.astype("U").tobytes()+code.encode()).hexdigest()
-    if signature != expected:
+    if signature != accumulator_signature(ids):
         raise ValueError("object accumulator signature differs from current inputs")
     return ids, acc, signature
 
@@ -419,20 +434,89 @@ def max_t(point, reps, j, others, long):
     return statistic, np.percentile(null, 95), np.mean(null >= statistic), delta, se
 
 
+SHORT = np.arange(4)
+
+
+def candidate_sample():
+    ids, acc, signature = candidate_accumulator()
+    sample = pd.read_parquet(DATA / "plate_completeness_sample.parquet")
+    if not sample.OBJID[sample.all_nocut].isin(ids).all():
+        raise ValueError("object accumulator lacks all_nocut quasars")
+    return ids, acc, signature, sample
+
+
+def band_inputs(ids, acc, sample, bi):
+    return acc[:, bi, :13 if bi == 0 else 14], sample[sample.band.eq("gr"[bi])].set_index("OBJID").reindex(ids)
+
+
+def expand(a):
+    return np.broadcast_to(a[:, None], (len(a), len(DIAGNOSIS), *a.shape[1:]))
+
+
+def fixed_members(a, s, band):
+    import ensemble_structure_function as esf
+
+    fixed = np.stack([(a[..., 0] > 0).all(axis=1) & s[n].fillna(False).to_numpy(bool) for n in DIAGNOSIS], axis=1)
+    use = fixed.any(axis=1)
+    ids = s.index.to_numpy(str)[use]
+    nt = esf.clean_nightly(load_completeness_lightcurves(ids))[0].query("band == @band")
+    return use, fixed[use], ids, nt, DIAGNOSIS.index(ADOPTED_SELECTION[band])
+
+
+def sf_ratios(r, fid):
+    import ensemble_structure_function as esf
+
+    long = np.flatnonzero(esf.CENTERS[:r.shape[-1]] >= 2371)
+    return {k: np.exp(np.log(r[..., i]/r[..., i][..., [fid], :]).mean(axis=-1)/2) for k, i in (("short", SHORT), ("long", long))}
+
+
+def fixed_diagnosis(a, s, x, band, n_common, n_boot, seed):
+    import ensemble_structure_function as esf
+    from fit_structure_function import POPDRW_COEF, macleod_drw
+
+    use, fixed, ids, nt, fid = fixed_members(a, s, band)
+    a, s, x = a[use], s[use], x[use]
+    expanded = expand(a)
+    sf2 = esf.ensemble_second_moment(expanded, weights=fixed[..., None].astype(float))
+    reps = esf.object_bootstrap(expanded, n_boot=n_boot, seed=seed, weights=fixed[..., None].astype(float))[1]
+    mean = lambda v, m=fixed: (np.nan_to_num(v).T @ m/m.sum(axis=0)).T
+    noise = mean((a[:, SHORT, 2]-a[:, SHORT, 4])/a[:, SHORT, 0])/sf2[:, SHORT]
+    share = {}
+    for sv in ("sdss", "ps1", "ztf"):
+        b = esf.accumulate(nt.assign(mag=0., sig=nt.survey.eq(sv).astype(float)), ids, s.z, bands=[band])[:, 0, SHORT]
+        np.testing.assert_array_equal(b[..., 0], a[:, SHORT, 0])
+        share[sv] = mean(b[..., 2]/(2*b[..., 0])).mean(axis=1)
+    lum = s.loglbol.where(s.loglbol > 0).to_numpy()
+    logf = np.column_stack(macleod_drw(POPDRW_COEF, band, s.z.to_numpy(), 90-2.5*lum, x[:, 0]))
+    logf -= np.nanmean(logf, axis=0)
+    valid = fixed & np.isfinite(logf).all(axis=1)[:, None]
+    model = {k: np.sqrt(mean(10**(2*logf[:, 0]-p*logf[:, 1]), valid)) for k, p in (("short", 1), ("long", 0))}
+    point, boot = sf_ratios(sf2, fid), sf_ratios(reps, fid)
+    observed = {k: (point[k], *np.percentile(boot[k], [16, 84], axis=0)) for k in point}
+    rows = [dict(band=band, selection=name, weighting="fixed", n_objects=int(m.sum()), n_common_cells=n_common,
+                 median_z=np.median(s.z[m]), median_loglbol=np.nanmedian(lum[m]), median_logmbh=np.nanmedian(x[m, 0]),
+                 median_logedd=np.nanmedian(x[m, 1]), median_ccd_mag=np.median(s.reference_mag[m]),
+                 **{f"noise_over_sf2_{c:.0f}d": v for c, v in zip(esf.CENTERS[SHORT], noise[j])},
+                 **{f"ccd_fraction_{sv}": v[j] for sv, v in share.items()},
+                 **{f"macleod_ratio_{k}": v[j]/v[fid] for k, v in model.items()},
+                 **{f"sf_ratio_{k}{q}": v[i][j] for k, v in observed.items() for i, q in enumerate(("", "_lo", "_hi"))})
+            for j, name in enumerate(DIAGNOSIS) for m in [fixed[:, j]]]
+    return rows
+
+
 def property_control(n_boot=2000):
     import ensemble_structure_function as esf
     from fit_structure_function import _object_amplitude
 
-    ids, acc, signature = candidate_accumulator()
-    sample = pd.read_parquet(DATA / "plate_completeness_sample.parquet")
+    ids, acc, signature, sample = candidate_sample()
     x = esf.load_properties(ids).reindex(ids).to_numpy(float)
     native = pd.read_csv(DATA / "structure_function_completeness_sweep.csv")
-    rows, summary, differences, checks, weight_rows, cell_rows = [], [], [], [], [], []
+    rows, summary, differences, checks, weight_rows, cell_rows, diagnosis = [], [], [], [], [], [], []
     for bi, band in enumerate("gr"):
-        s = sample[sample.band.eq(band)].set_index("OBJID").reindex(ids)
-        endpoint = 13 if band == "g" else 14
-        a = acc[:, bi, :endpoint]
+        a, s = band_inputs(ids, acc, sample, bi)
+        endpoint = a.shape[1]
         names, masks, _, _, common = property_support(a, s, x)
+        diagnosis += fixed_diagnosis(a, s, x, band, len(common), n_boot, 1008+bi)
         if len(common) < 4:
             checks.append(dict(band=band, status="insufficient_property_support", n_common_cells=len(common),
                                n_brightest=int(masks[:, -1].sum()), required_common_cells=4))
@@ -497,7 +581,7 @@ def property_control(n_boot=2000):
                                             lag_center_days=esf.CENTERS[k], difference_mag=point[j, k]-point[l, k],
                                             difference_lo_mag=lo, difference_hi_mag=hi,
                                             difference_se_mag=se[0, q], bootstrap_draws=n_boot))
-    for name, data in [("properties", summary), ("property_control", rows), ("property_differences", differences),
+    for name, data in [("properties", summary + diagnosis), ("property_control", rows), ("property_differences", differences),
                        ("property_stability", checks), ("property_weights", weight_rows), ("property_cells", cell_rows)]:
         pd.DataFrame(data).to_csv(DATA / f"structure_function_completeness_{name}.csv", index=False)
     footprint_check(sample, pd.read_parquet(DATA / "plate_completeness_opportunities.parquet"))

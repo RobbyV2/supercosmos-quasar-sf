@@ -20,6 +20,7 @@ ASINH_B = np.array([1.4, .9, 1.2, 1.8, 7.4]) * 1e-10
 BANDS = dict(zip("ugriz", [f"SLOAN_SDSS.{b}.dat" for b in "ugriz"]))
 BANDS.update(bj="serc-j.txt", r_native="serc-r.txt", e="possi-e.txt", tp="techpan_og590.txt")
 EBV = np.arange(0., .551, .005)
+SED_CHI2_MAX = 25.
 PASSBAND_URLS = dict(
     parker="https://www.cambridge.org/core/services/aop-cambridge-core/content/view/878CF0C11CE7BC44BCA9294637F46981/S132335800000597Xa.pdf/the-introduction-of-tech-pan-film-at-the-uk-schmidt-telescope.pdf",
     schott="https://www.schott.com/-/media/project/onex/products/o/optical-filter-glass/downloads/schott-datasheet-collection-filter-en_112019.pdf?rev=766d730fb2ac41fd82165f3f74ee7ae3")
@@ -95,12 +96,10 @@ def _weights(wave: np.ndarray, wf: np.ndarray, tf: np.ndarray) -> np.ndarray:
             + np.bincount(ix + 1, weights * frac, minlength=len(wave)))
 
 
-def model_grid(energy: bool = False, tilt: float = 0., og590: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def model_grid(energy: bool = False, og590: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     path = DATA / "bosz/synthetic_photometry.npz"
     key = "magnitudes_energy" if energy else "magnitudes"
     vkey = "vega_energy" if energy else "vega"
-    if tilt:
-        key, vkey = f"magnitudes_tilt{tilt:g}", f"vega_tilt{tilt:g}"
     if og590:
         key, vkey = "magnitudes_og590", "vega_og590"
     if path.exists():
@@ -117,9 +116,6 @@ def model_grid(energy: bool = False, tilt: float = 0., og590: bool = False) -> t
         filters[6] = al.read_bandpass("iiiaf_og590.txt")
     elif energy:
         filters = [(w, t / w) if 5 <= j <= 7 else (w, t) for j, (w, t) in enumerate(filters)]
-    elif tilt:
-        filters = [(w, t * (w / np.sqrt(w.min() * w.max())) ** tilt) if j >= 5 else (w, t)
-                   for j, (w, t) in enumerate(filters)]
     weights = np.stack([_weights(wave, *f) for f in filters])
     vega = np.array([0.] * 5 + [al.ab_minus_vega(*f) for f in filters[5:]])
     ext = np.array([F99(Rv=3.1).extinguish(wave * u.AA, Ebv=e) for e in EBV])
@@ -226,7 +222,7 @@ def run() -> None:
         table.loc[ok, f"{delta}_err"] = fixed["delta_err"][:, j]
         table[f"{name}_native"] = table[ref] - table[delta]
         table[f"{name}_native_err"] = np.hypot(table[f"{ref}_err"], table[f"{delta}_err"])
-    table["fit_ok"] = ok & (table.chi2 < 25.)
+    table["fit_ok"] = ok & (table.chi2 < SED_CHI2_MAX)
     table.loc[ok, "fit_ok"] &= np.max(np.abs(fixed["residual"]), axis=1) < .1
     _save(table)
     print(f"Fixed-column fits saved: {table.fit_ok.sum()} accepted", flush=True)
@@ -246,7 +242,7 @@ def run() -> None:
     _save(table)
     qualified, good = table[table.input_ok], table[table.fit_ok]
     summary = dict(counts=dict(all=len(table), input_ok=len(qualified), fit_ok=len(good),
-                              chi2_ge25=int((qualified.chi2 >= 25).sum()),
+                              chi2_ge25=int((qualified.chi2 >= SED_CHI2_MAX).sum()),
                               max_resid_ge01=int((qualified[[b + "_residual" for b in "ugriz"]].abs().max(axis=1) >= .1).sum()),
                               grid_edge_fit_ok=int(good.grid_edge.sum())),
                    n_grid_models=len(params),
@@ -270,7 +266,7 @@ def _save(table: pd.DataFrame) -> None:
     temporary.replace(path)
 
 
-def native_response_sensitivity(tilts: bool = False, og590: bool = False) -> None:
+def native_response_sensitivity(og590: bool = False) -> None:
     base_params, primary, _ = model_grid()
     params, primary = dense_grid(base_params, primary)
     table = pd.read_parquet(DATA / "standard_star_sed.parquet")
@@ -280,7 +276,7 @@ def native_response_sensitivity(tilts: bool = False, og590: bool = False) -> Non
     if np.any(indices < 0):
         raise ValueError("Fitted atmosphere missing from response sensitivity grid")
     response_path = DATA / "standard_star_sed_response.parquet"
-    out = (pd.read_parquet(response_path) if response_path.exists() else table[["star"]].copy()) if tilts or og590 else table
+    out = (pd.read_parquet(response_path) if response_path.exists() else table[["star"]].copy()) if og590 else table
     ebv = table.loc[ok, "ebv"].to_numpy()
     if og590:
         _, alternate, _ = model_grid(og590=True)
@@ -294,19 +290,17 @@ def native_response_sensitivity(tilts: bool = False, og590: bool = False) -> Non
         native = table.loc[ok, "r"].to_numpy() - result["delta"][:, 1] + correction
         out.loc[ok, "r_native_og590_shift"] = native - table.loc[ok, "r_native"].to_numpy()
         out.loc[ok, "r_native_og590_err"] = np.hypot(table.loc[ok, "r_err"], result["delta_err"][:, 1])
-    bands = ["bj", "r", "e", "tp"] if tilts else ["bj", "r", "e"]
-    for tilt in (() if og590 else ((1, 2) if tilts else (0,))):
-        _, alternate, _ = model_grid(tilt=tilt, energy=not tilts)
+    else:
+        _, alternate, _ = model_grid(energy=True)
         _, alternate = dense_grid(base_params, alternate)
-        shift = np.zeros((len(indices), len(bands)))
+        shift = np.zeros((len(indices), 3))
         for start in range(0, len(indices), 8192):
             sl = slice(start, start + 8192)
             args = ebv[sl], indices[sl, None]
-            shift[sl] = (_at_ebv(alternate, *args) - _at_ebv(primary, *args))[:, 0, 5:5 + len(bands)]
-        label = f"tilt{tilt}" if tilts else "energy"
-        for j, band in enumerate(bands):
-            out.loc[ok, f"{band}_native_{label}_shift"] = shift[:, j]
-    if tilts or og590:
+            shift[sl] = (_at_ebv(alternate, *args) - _at_ebv(primary, *args))[:, 0, 5:8]
+        for j, band in enumerate(("bj", "r", "e")):
+            out.loc[ok, f"{band}_native_energy_shift"] = shift[:, j]
+    if og590:
         temporary = response_path.with_suffix(".parquet.tmp")
         out.to_parquet(temporary, index=False)
         temporary.replace(response_path)
@@ -354,7 +348,6 @@ def build_passbands(out: Path = DATA) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--response-sensitivity", action="store_true")
-    parser.add_argument("--response-tilts", action="store_true")
     parser.add_argument("--og590", action="store_true")
     parser.add_argument("--build-passbands", nargs="?", const=DATA, type=Path)
     args = parser.parse_args()
@@ -362,8 +355,6 @@ if __name__ == "__main__":
         build_passbands(args.build_passbands)
     elif args.og590:
         native_response_sensitivity(og590=True)
-    elif args.response_tilts:
-        native_response_sensitivity(tilts=True)
     elif args.response_sensitivity:
         native_response_sensitivity()
     else:

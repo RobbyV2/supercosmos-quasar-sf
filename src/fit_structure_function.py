@@ -6,23 +6,18 @@ from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.table import Table
-from scipy.optimize import curve_fit
-from scipy.stats import chi2 as chi2_dist
 
 import ensemble_structure_function as esf
-from ensemble_structure_function import (BANDS, CENTERS, EDGES, NB, accumulate,
-                                         ledoit_wolf)
+from ensemble_structure_function import BANDS, CENTERS, EDGES, NB, accumulate
 
 _ROOT = Path(__file__).resolve().parent.parent
 SHORT_MAX_D = 3000.0
 PLATEAU_MIN_D = 400.0  # plateau fit start (CCD lags 422-2371 d)
 LONG_MIN_D = 11 * 365.25  # 11 rest-frame yr; excess bins beyond
-DRW_BOUNDS = ([1e-3, 1.0], [3.0, 1e6])
 STONE_FITS = "data/stone2022_ensemble_sf_psd.fits.gz"
 STONE_LC = "data/stone2022_lightcurves.fits.gz"
 STONE_FLOOR_END_D = {"g": 5.0, "r": 20.0, "i": 40.0}
 FIXED_CSV = "data/structure_function_fixed_population.csv"
-GLS_TAU0 = [50.0, 200.0, 700.0, 2000.0]
 
 
 def stone_grid():
@@ -37,24 +32,6 @@ def stone_grid():
 
 def plateau_bins(dt, lo=PLATEAU_MIN_D, hi=SHORT_MAX_D):
     return (dt >= lo) & (dt <= hi)
-
-
-def drw(dt, sf_inf, tau):
-    return sf_inf * np.sqrt(1.0 - np.exp(-dt / tau))
-
-
-def powerlaw(dt, a, gamma):
-    return a * (dt / 1000.0) ** gamma
-
-
-def fit(model, dt, sf, err, p0, bounds=(-np.inf, np.inf)):
-    popt, pcov = curve_fit(model, dt, sf, p0=p0, sigma=err, absolute_sigma=True,
-                           bounds=bounds, maxfev=20000)
-    perr = np.sqrt(np.diag(pcov))
-    r = sf - model(dt, *popt)
-    chi2 = float(r @ np.linalg.solve(err, r)) if np.ndim(err) == 2 else np.sum((r / err) ** 2)
-    dof = len(dt) - len(popt)
-    return popt, perr, pcov, chi2 / dof
 
 
 MACLEOD_POSS1 = dict(lag_center_days=7943.732775527159, sf_mag=0.3498202596480719, sf_lo_mag=0.2999244789127741,
@@ -120,8 +97,25 @@ def literature_choices(n_boot=2000):
 
 
 POPDRW_COEF = {"sfinf": (-0.51, -0.479, 0.131, 0.18), "tau": (2.4, 0.17, 0.03, 0.21)}
-POPDRW_SIG = (0.149, 0.26)
 POPDRW_LAM_OBS = {"g": 4800.0, "r": 6250.0}
+GROUPS = ("lowmbh_lowedd", "lowmbh_highedd", "highmbh_lowedd", "highmbh_highedd")
+
+
+def bootstrap_plan(band, name):
+    bi = BANDS.index(band)
+    match name.split("_"):
+        case ["fiducial"]:
+            return 5000, 1927 + bi
+        case ["grid", i, j]:
+            return 2000, 4400 + 100 * bi + 3 * int(i) + int(j)
+        case _:
+            return 3000, 3300 + 10 * bi + GROUPS.index(name)
+
+
+def macleod_drw(coef, band, z, mi, logmbh):
+    x = np.column_stack([np.ones(len(z)), np.log10(POPDRW_LAM_OBS[band]/(1+np.asarray(z))/4000),
+                         np.asarray(mi)+23, np.asarray(logmbh)-9])
+    return [x @ np.asarray(coef[c]) for c in ("sfinf", "tau")]
 
 
 def _pw_quant(v, w, ps=(0.1, 0.5, 0.9)):
@@ -181,136 +175,25 @@ def _object_lag_kernel(nightly, ids, zmap, n_bins, subdivisions=32):
     return nodes, weights, count
 
 
-def _object_sampled_models(kernel):
-    nodes, weights = kernel[:2]
-    def mean(values):
-        return (values*weights).sum(axis=2).mean(axis=0)
-    def choose(x):
-        return np.abs(np.asarray(x)[:,None]-CENTERS[:nodes.shape[1]]).argmin(axis=1)
-    def sampled_drw(x, amplitude, tau):
-        return amplitude*np.sqrt(mean(-np.expm1(-nodes/tau)))[choose(x)]
-    def sampled_powerlaw(x, amplitude, slope):
-        # empty cells have zero weight; floor avoids 0**negative
-        v = (np.maximum(nodes, 1e-9)/1000.)**(2*slope)
-        return amplitude*np.sqrt(mean(v))[choose(x)]
-    def drw_jacobian(x, amplitude, tau):
-        root = np.sqrt(mean(-np.expm1(-nodes/tau)))
-        derivative = -amplitude*mean(np.exp(-nodes/tau)*nodes)/(2*tau**2*root)
-        return np.column_stack([root, derivative])[choose(x)]
-    return sampled_drw, sampled_powerlaw, drw_jacobian
-
-
-def _extrapolation_cov(cov, fitted, jac, pcov, rchi2=1.):
-    cross = cov[:, fitted] @ np.linalg.solve(cov[np.ix_(fitted, fitted)], jac[fitted]) @ pcov @ jac.T
-    return cov + max(rchi2, 1.) * jac @ pcov @ jac.T - cross - cross.T
-
-
-def _object_fit(a, reps, name, band, kernel=None, fit_range=(PLATEAU_MIN_D, SHORT_MAX_D), short_only=False):
-    v = esf.ensemble_second_moment(a)
-    sf = _object_amplitude(v)
-    ok = (v > 0) & np.isfinite(reps).all(axis=0)
-    short = ok & plateau_bins(CENTERS[:len(v)], *fit_range)
-    if short.sum() < 4:
-        return None
-    cov = np.cov(reps[:, ok], rowvar=False)
-    sd = np.sqrt(np.diag(cov))
-    corr, _, _ = ledoit_wolf(reps[:, ok]/sd)
-    cov = corr*np.outer(sd, sd)
-    short_ok = short[ok]
-    dt, y = CENTERS[:len(v)][ok], sf[ok]
-    if kernel is None:
-        raise ValueError('Object-first model fits require the actual pair-lag kernel')
-    sampled_drw, sampled_powerlaw, sampled_jacobian = _object_sampled_models(kernel)
-    results = []
-    for model, key, m in [(sampled_drw, 'drw_short', short_ok), (sampled_drw, 'drw_all', np.ones(len(y), bool)),
-                          (sampled_powerlaw, 'powerlaw_all', np.ones(len(y), bool))]:
-        if short_only and key != 'drw_short':
-            continue
-        try:
-            if model == sampled_drw:
-                trials = [fit(model, dt[m], y[m], cov[np.ix_(m, m)], [y[m].max(), t], DRW_BOUNDS)
-                          for t in GLS_TAU0]
-                p, e, pc, rc = min(trials, key=lambda r:r[3])
-            else:
-                p, e, pc, rc = fit(model, dt[m], y[m], cov[np.ix_(m, m)], [y[m].max(), .25])
-            results.append(dict(sample=name, band=band, model=key, amplitude=p[0],
-                                amplitude_err=e[0], timescale_or_slope=p[1],
-                                timescale_or_slope_err=e[1], reduced_chi2=rc,
-                                n_bins=int(m.sum()), n_objects=len(a)))
-            if key == 'drw_short':
-                short_p, short_pc, scale = p, pc, max(rc, 1.)
-        except (ValueError, RuntimeError, np.linalg.LinAlgError):
-            results.append(dict(sample=name, band=band, model=key, n_bins=int(m.sum()), n_objects=len(a)))
-    if 'short_p' not in locals():
-        return None
-    excess = y-sampled_drw(dt, *short_p)
-    residual_cov = _extrapolation_cov(cov, short_ok, sampled_jacobian(dt, *short_p), short_pc, scale)
-    last = np.flatnonzero(dt > LONG_MIN_D)
+def _object_rises(a, reps, name, band):
+    sf = _object_amplitude(esf.ensemble_second_moment(a))
+    k0 = int(np.argmin(abs(CENTERS[:len(sf)]-2371)))
     rise = []
-    k0 = int(np.argmin(abs(CENTERS[:len(v)]-2371)))
-    for k in np.flatnonzero(CENTERS[:len(v)] > LONG_MIN_D):
+    for k in np.flatnonzero(CENTERS[:len(sf)] > LONG_MIN_D):
         diff = reps[:, k]-reps[:, k0]
-        q = np.percentile(diff, [16, 50, 84])
+        lo, hi = np.percentile(diff, [16, 84])
         rise.append(dict(sample=name, band=band, lag_center_days=CENTERS[k],
                          sf_anchor_mag=sf[k0], sf_mag=sf[k], rise_mag=sf[k]-sf[k0],
-                         rise_lo_mag=q[0], rise_hi_mag=q[2],
+                         rise_lo_mag=lo, rise_hi_mag=hi,
                          rise_bootstrap_sigma=float(diff.std(ddof=1)),
                          ratio=sf[k]/sf[k0]))
-    for j in last:
-        results.append(dict(sample=name, band=band, model='drw_extrapolation',
-                            lag_center_days=dt[j], excess_mag=excess[j],
-                            excess_err_mag=np.sqrt(max(residual_cov[j,j],0)), scale_factor=scale, n_objects=len(a)))
-    if len(last):
-        r=excess[last]
-        c=residual_cov[np.ix_(last,last)]
-        x=float(r@np.linalg.solve(c,r))
-        results.append(dict(sample=name,band=band,model='drw_joint_extrapolation',
-                            chi2=x,n_bins=len(last),pvalue=chi2_dist.sf(x,len(last)),scale_factor=scale,n_objects=len(a)))
-    return results, rise, short_p, cov, scale*short_pc
-
-
-def _object_plate_jackknife(nightly, ids, zmap, a, band):
-    table = {o: k for k, o in enumerate(ids)}
-    plates = np.sort(nightly.loc[nightly.sss, 'plate'].unique())
-    plate_index = {p:i for i,p in enumerate(plates)}
-    base = esf.object_second_moments(a)
-    numer = np.nansum(base, axis=0)[None, :].repeat(len(plates), axis=0)
-    denom = np.isfinite(base).sum(axis=0)[None, :].repeat(len(plates), axis=0)
-    contributing = np.zeros((len(plates), a.shape[1]), bool)
-    for o, sub in nightly.groupby('OBJID', sort=False):
-        iq = table[o]
-        t, m, e = (sub[k].to_numpy(float) for k in ['night','mag','sig'])
-        pl, pc = sub.plate.to_numpy(), sub.pcode.to_numpy()
-        fv = sub[esf.FV_COLS].to_numpy(float)
-        for p in np.unique(pl[sub.sss.to_numpy(bool)]):
-            ip = plate_index[p]
-            rows = np.flatnonzero(pl == p)
-            ii, jj = np.unique(np.sort(np.stack([np.repeat(rows,len(sub)), np.tile(np.arange(len(sub)),len(rows))]),axis=0),axis=1)
-            valid = ii != jj
-            ii, jj = ii[valid], jj[valid]
-            bins = np.searchsorted(EDGES, abs(t[jj]-t[ii])/(1+zmap[o]), side='right')-1
-            valid = (bins >= 0) & (bins < a.shape[1])
-            ii,jj,bins = ii[valid],jj[valid],bins[valid]
-            n = np.bincount(bins,minlength=a.shape[1])
-            v = np.bincount(bins,weights=(m[jj]-m[ii])**2-e[ii]**2-e[jj]**2-fv[ii,pc[jj]],minlength=a.shape[1])
-            left = a[iq,:,0]-n
-            rem = np.divide(a[iq,:,1]-a[iq,:,2]-v,left,out=np.full(len(left),np.nan),where=left>0)
-            numer[ip] += np.nan_to_num(rem)-np.nan_to_num(base[iq])
-            denom[ip] += np.isfinite(rem).astype(int)-np.isfinite(base[iq]).astype(int)
-            contributing[ip] |= n>0
-    theta = _object_amplitude(np.divide(numer,denom,out=np.full_like(numer,np.nan),where=denom>0))
-    err = np.full(a.shape[1], np.nan)
-    for k in range(a.shape[1]):
-        t = theta[contributing[:,k],k]
-        if len(t)>1:
-            err[k] = np.sqrt((len(t)-1)/len(t)*np.sum((t-t.mean())**2))
-    return err, contributing.sum(axis=0), theta, contributing
+    return rise
 
 
 def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
     from plate_completeness import ADOPTED_SELECTION
     rows, compare, panels, matched_rows, shape_rows, criteria = [], [], {}, [], [], []
-    candidates = [f'{kind}_cut_{margin}' for kind in ['plate','all'] for margin in ['025','050','075','100','125']]
+    candidates = [f'{kind}_cut_{margin}' for kind in ['plate','all'] for margin in ['025','050','075','100','125']]+['all_nocut','all_lim050','all_cut_000','all_lim095']
     adopted = {}
     for bi, band in enumerate(BANDS):
         s = sample[sample.band.eq(band)].set_index('OBJID').reindex(ids)
@@ -330,17 +213,15 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
                 rows.append(dict(band=band,selection=name,lag_center_days=CENTERS[k],n_fixed=int(use.sum()),
                                  sf_mag=pointsf[c,k],sf_lo_mag=bounds[0,c,k],sf_hi_mag=bounds[2,c,k],
                                  median_z=float(np.nanmedian(z[use])),median_loglbol=float(np.nanmedian(lum[use]))))
-        for ci,name in enumerate(candidates):
-            for cj in range(ci+1,len(candidates)):
-                if candidates[cj].split('_')[0] != name.split('_')[0]:
-                    continue
-                delta = reps[:,ci]-reps[:,cj]
-                for k in long:
-                    q = np.percentile(delta[:,k],[16,84])
-                    compare.append(dict(band=band,selection=name,comparison=candidates[cj],lag_center_days=CENTERS[k],
-                                        difference_mag=pointsf[ci,k]-pointsf[cj,k],difference_lo_mag=q[0],
-                                        difference_hi_mag=q[1],difference_se_mag=delta[:,k].std(ddof=1),
-                                        n_fixed=int(masks[:,ci].sum()),n_comparison=int(masks[:,cj].sum()),bootstrap_draws=n_boot))
+        pairs = [(i,j) for i in range(10) for j in range(i+1,10) if candidates[i].split('_')[0]==candidates[j].split('_')[0]]
+        for ci,cj in pairs+[(i,5) for i in range(10,len(candidates))]:
+            delta = reps[:,ci]-reps[:,cj]
+            for k in long:
+                q = np.percentile(delta[:,k],[16,84])
+                compare.append(dict(band=band,selection=candidates[ci],comparison=candidates[cj],lag_center_days=CENTERS[k],
+                                    difference_mag=pointsf[ci,k]-pointsf[cj,k],difference_lo_mag=q[0],
+                                    difference_hi_mag=q[1],difference_se_mag=delta[:,k].std(ddof=1),
+                                    n_fixed=int(masks[:,ci].sum()),n_comparison=int(masks[:,cj].sum()),bootstrap_draws=n_boot))
         full=masks[:,5]
         ze=np.quantile(z[full],[0,.5,1])
         le=np.quantile(lum[full],[0,.5,1])
@@ -349,11 +230,11 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
         target=(occupancy.min(axis=0)>=5).astype(float)
         if target.any():
             wc=np.stack([np.divide(target,n,out=np.zeros(4),where=n>0)[cell] for n in occupancy],axis=1)
-            mw=w[:,5:]*wc[:,:,None]
-            mpoint=_object_amplitude(esf.ensemble_second_moment(expanded[:,5:],weights=mw))
-            mbounds,mreps=esf.object_bootstrap(expanded[:,5:],n_boot=n_boot,seed=927+bi,weights=mw)
+            mw=w[:,5:10]*wc[:,:,None]
+            mpoint=_object_amplitude(esf.ensemble_second_moment(expanded[:,5:10],weights=mw))
+            mbounds,mreps=esf.object_bootstrap(expanded[:,5:10],n_boot=n_boot,seed=927+bi,weights=mw)
             mbounds=_object_amplitude(mbounds)
-            for c,name in enumerate(candidates[5:]):
+            for c,name in enumerate(candidates[5:10]):
                 for k in long:
                     matched_rows.append(dict(band=band,selection=name,lag_center_days=CENTERS[k],
                                              sf_mag=mpoint[c,k],sf_lo_mag=mbounds[0,c,k],sf_hi_mag=mbounds[2,c,k],
@@ -370,20 +251,20 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
                                            lag_center_days=CENTERS[k],ratio_difference=normalized[ci,k]-normalized[cj,k],
                                            difference_lo=q[0],difference_hi=q[1],difference_se=delta[:,k].std(ddof=1)))
         checks=[]
-        for ci in range(5,8):
+        for ci,others in [*((c,range(c+1,10)) for c in range(5,8)),(10,[5]),(11,[5]),(12,range(5,10)),(13,[5])]:
             all_stable=True
-            for cj in range(ci+1,10):
+            for cj in others:
                 delta=reps[:,ci,long]-reps[:,cj,long]
                 se=delta.std(axis=0,ddof=1)
                 centered=(delta-delta.mean(axis=0))/se
                 threshold=np.percentile(np.max(abs(centered),axis=1),95)
                 statistic=float(np.max(abs(pointsf[ci,long]-pointsf[cj,long])/se))
-                all_stable &= statistic <= threshold and masks[:,cj].sum()>=50
+                skipped = masks[:,cj].sum()<50
+                all_stable &= statistic <= threshold or skipped
                 criteria.append(dict(band=band,selection=candidates[ci],comparison=candidates[cj],
                                      maximum_standardized_difference=statistic,threshold95=threshold,
                                      simultaneous_p=float((np.max(abs(centered),axis=1)>=statistic).mean()),
-                                     n_comparison=int(masks[:,cj].sum()),bootstrap_draws=n_boot))
-            eligible = s[candidates[ci]].fillna(False).to_numpy(bool)
+                                     n_comparison=int(masks[:,cj].sum()),skipped=bool(skipped),bootstrap_draws=n_boot))
             recovery_table=pd.read_csv(_ROOT/'data/plate_completeness_cut_sweep.csv')
             recovery_row=recovery_table[recovery_table.band.eq(band)&recovery_table.selection.eq(candidates[ci])].iloc[0]
             recovery=float(recovery_row.n_objects_archive_detection/recovery_row.n_parent)
@@ -402,25 +283,19 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
 
 
 def object_first_results():
-    import hashlib
-    import inspect
     import json
     import shutil
-    from plate_completeness import load_completeness_lightcurves
+    from plate_completeness import accumulator_signature, load_completeness_lightcurves
 
     output=esf.CACHE/'object_first'
     output.mkdir(parents=True,exist_ok=True)
     sample=pd.read_parquet(_ROOT/'data/plate_completeness_sample.parquet')
     sample['OBJID']=sample.OBJID.astype(str)
-    ids=np.sort(sample.loc[sample.plate_cut_025,'OBJID'].unique()).astype(str)
+    ids=np.sort(sample.loc[sample.all_nocut,'OBJID'].unique()).astype(str)
     cats=sample[sample.band.eq('g')].set_index('OBJID').reindex(ids)
     z,lum=cats.z.to_numpy(float),cats.loglbol.to_numpy(float)
     zmap=pd.Series(z,index=ids)
-    sources=['data/detection_correction_components.parquet','data/plate_native_pair_variance.csv']
-    kernels=[*esf.KERNELS,load_completeness_lightcurves]
-    stamp=(_ROOT/esf.LC_PARQUET).stat()
-    code=''.join(inspect.getsource(f) for f in kernels)+f'{stamp.st_size}:{stamp.st_mtime_ns}'
-    signature=hashlib.sha256(b''.join((_ROOT/p).read_bytes() for p in sources)+ids.astype('U').tobytes()+code.encode()).hexdigest()
+    signature=accumulator_signature(ids)
     cache=output/'object_accumulator.npz'
     completed=0
     acc=np.zeros((len(ids),len(BANDS),NB,6))
@@ -429,23 +304,17 @@ def object_first_results():
             if str(f['signature'])==signature:
                 acc=f['acc']
                 completed=int(f['completed']) if 'completed' in f else len(ids)
-    nightly=None
-    if completed<len(ids):
-        lc=load_completeness_lightcurves(ids)
-        print(f'Accumulating {len(ids)} quasars, {len(lc)} epochs without detection corrections',flush=True)
-        nightly=esf.clean_nightly(lc)[0]
-        del lc
-        for start in range(completed,len(ids),1000):
-            stop=min(start+1000,len(ids))
-            part=ids[start:stop]
-            acc[start:stop]=accumulate(nightly[nightly.OBJID.isin(part)],part,zmap,resid=True)
-            np.savez_compressed(cache,acc=acc,ids=ids,signature=signature,completed=stop)
-            print(f'Accumulated {stop}/{len(ids)} objects',flush=True)
+    for start in range(completed,len(ids),1000):
+        stop=min(start+1000,len(ids))
+        part=ids[start:stop]
+        acc[start:stop]=accumulate(esf.clean_nightly(load_completeness_lightcurves(part))[0],part,zmap,resid=True)
+        np.savez_compressed(cache,acc=acc,ids=ids,signature=signature,completed=stop)
+        print(f'Accumulated {stop}/{len(ids)} objects',flush=True)
     adopted=_object_completeness_sweep(acc,ids,sample,z,lum,output)
     for band in BANDS:
         sample.loc[sample.band.eq(band),'adopted_keep']=sample.loc[sample.band.eq(band),adopted[band]]
     sample.to_parquet(_ROOT/'data/plate_completeness_sample.parquet',index=False)
-    rows,comparisons,fits_rows,rises=[],[],[],[]
+    rows,comparisons,rises,redshift=[],[],[],[]
     bootstrap_outputs={}
     selected={}
     for bi,band in enumerate(BANDS):
@@ -455,37 +324,22 @@ def object_first_results():
         keep=available&(acc[:,bi,:endpoint+1,0]>0).all(axis=1)
         a=acc[keep,bi,:endpoint+1]
         oid=ids[keep]
-        table,reps=_object_summary(a,z[keep],lum[keep],seed=1927+bi)
+        table,reps=_object_summary(a,z[keep],lum[keep],*bootstrap_plan(band,"fiducial"))
         table['sample']='fixed'
         table['band']=band
         table['selection']=adopted[band]
-        if nightly is None:
-            nt=esf.clean_nightly(load_completeness_lightcurves(oid).query('band == @band'))[0]
-        else:
-            nt=nightly[nightly.OBJID.isin(oid)&nightly.band.eq(band)]
-        jack,npl,theta,contributing=_object_plate_jackknife(nt,oid,zmap,a,band)
-        table['sf_jack_err_mag']=jack
-        table['n_plates_jack']=npl
-        table['sf_adopt_err_mag']=table.sf_err_mag
+        nt=esf.clean_nightly(load_completeness_lightcurves(oid).query('band == @band'))[0]
+        nights=nt.groupby('OBJID').night
+        span,edge=(nights.max()-nights.min()).max(),EDGES[endpoint]
+        redshift.append(dict(band=band,n=len(oid),z_min=z[keep].min(),z_median=np.median(z[keep]),z_max=z[keep].max(),
+                             final_bin_lower_edge_days=edge,max_observed_separation_days=span,implied_z_max=span/edge-1))
         rows.append(table)
         kernel=_object_lag_kernel(nt,oid,zmap,a.shape[1])
         np.testing.assert_array_equal(kernel[2],a[...,0])
-        analysis=_object_fit(a,reps,'fixed',band,kernel)
-        if analysis is None:
-            raise ValueError(f'{band}: fixed sample has insufficient bins for DRW fit')
-        fr,rr,_,cov,_=analysis
-        fits_rows+=fr
-        for row in rr:
-            k=int(np.argmin(abs(CENTERS-row['lag_center_days'])))
-            anchor=int(np.argmin(abs(CENTERS-2371)))
-            use=contributing[:,k]|contributing[:,anchor]
-            td=theta[use,k]-theta[use,anchor]
-            row['rise_plate_jack_sigma']=np.sqrt((len(td)-1)/len(td)*np.sum((td-td.mean())**2))
-        rises+=rr
-        bootstrap_outputs[f'cov_{band}']=cov
+        rises+=_object_rises(a,reps,'fixed',band)
         bootstrap_outputs[f'replicates_{band}']=reps
         bootstrap_outputs[f'objids_{band}']=oid
-        selected[band]=(a,oid,z[keep],lum[keep],adopted[band],kernel)
+        selected[band]=(a,oid,z[keep],lum[keep],adopted[band])
         for key,value in zip(['nodes','weights','counts'],kernel):
             bootstrap_outputs[f'lag_{key}_{band}']=value
         for method in ['object_mean','pooled','object_median','positive_median']:
@@ -502,24 +356,26 @@ def object_first_results():
     fixed.to_csv(output/'structure_function_fixed_population.csv',index=False)
     pd.DataFrame(comparisons).to_csv(output/'structure_function_aggregation_comparison.csv',index=False)
     np.savez_compressed(output/'ensemble_sf_covariance.npz',**bootstrap_outputs)
-    _object_groups(selected,output,fits_rows,rises)
-    pd.DataFrame(fits_rows).to_csv(output/'structure_function_object_fits.csv',index=False)
+    _object_groups(selected,output,rises)
     pd.DataFrame(rises).to_csv(output/'structure_function_object_rises.csv',index=False)
+    pd.DataFrame(redshift).to_csv(output/'structure_function_fiducial_redshift.csv',index=False)
     (output/'adopted_selection.json').write_text(json.dumps(adopted,indent=2)+'\n')
-    for path in output.glob('*.csv'):
-        shutil.copy2(path,_ROOT/'data'/path.name)
+    for name in ['fixed_population','aggregation_comparison','object_rises','group_matching','matched_mbh_edd',
+                 'mbh_edd_grid','completeness_sweep','completeness_stability','completeness_shapes','completeness_matched',
+                 'completeness_differences','fiducial_redshift']:
+        shutil.copy2(output/f'structure_function_{name}.csv',_ROOT/'data'/f'structure_function_{name}.csv')
     shutil.copy2(output/'ensemble_sf_covariance.npz',_ROOT/'data/ensemble_sf_covariance.npz')
     print(f'Adopted object-first outputs: {output}',flush=True)
 
 
-def _object_groups(selected, output, fitrows, rises):
+def _object_groups(selected, output, rises):
     ids=np.unique(np.concatenate([v[1] for v in selected.values()]))
     properties=esf.load_properties(ids).reindex(ids)
     valid=properties.notna().all(axis=1)
     edges={n:np.quantile(properties.loc[valid,n],[0,.5,1]) for n in ['LOGMBH','LOGLEDD_RATIO']}
-    records,grid_records,matching,inputs=[],[],[],{}
-    for bi,band in enumerate(BANDS):
-        acc,oid,z,lum,_,kernel=selected[band]
+    records,grid_records,matching=[],[],[]
+    for band in BANDS:
+        acc,oid,z,lum,_=selected[band]
         p=properties.reindex(oid)
         good=p.notna().all(axis=1).to_numpy()
         cell,ncell=_cell_index(z,lum,2)
@@ -536,11 +392,11 @@ def _object_groups(selected, output, fitrows, rises):
                                      common_cell=bool(target[c]),minimum_objects=5))
         print(f'{band}: homogeneous groups {[int(m.sum()) for m in masks.values()]}; '
               f'{int(target.sum())}/{ncell} z-L cells with >=5/group',flush=True)
-        for gi,(name,keep) in enumerate(masks.items()):
+        for name,keep in masks.items():
             if keep.sum()<20:
                 continue
             a=acc[keep]
-            tab,reps=_object_summary(a,z[keep],lum[keep],n_boot=3000,seed=3300+10*bi+gi)
+            tab,reps=_object_summary(a,z[keep],lum[keep],*bootstrap_plan(band,name))
             tab['sample'],tab['band']=name,band
             tab['mbh_split'],tab['edd_split']=edges['LOGMBH'][1],edges['LOGLEDD_RATIO'][1]
             mi=0 if name.startswith('lowmbh') else 1
@@ -552,21 +408,15 @@ def _object_groups(selected, output, fitrows, rises):
             if target.any():
                 occupied=np.bincount(cell[keep],minlength=ncell)
                 weights=np.divide(target,occupied,out=np.zeros_like(target),where=occupied>0)[cell[keep],None]
-                matched,mreps=_object_summary(a,z[keep],lum[keep],n_boot=3000,seed=3300+10*bi+gi,weights=weights)
+                matched,mreps=_object_summary(a,z[keep],lum[keep],*bootstrap_plan(band,name),weights=weights)
                 for old,new in [('sf_mag','sf_matched_mag'),('sf_lo_mag','sf_matched_lo_mag'),
                                 ('sf_hi_mag','sf_matched_hi_mag'),('sf_err_mag','sf_matched_err_mag')]:
                     tab[new]=matched[old]
                 tab['n_objects_matched']=int((weights[:,0]>0).sum())
                 tab['cell_coverage']=1.
                 tab['z_med_matched'],tab['logl_med_matched']=matched.z_med,matched.logl_med
-            sub=tuple(v[keep] for v in kernel)
-            analysis=_object_fit(a,reps,name,band,sub)
-            if analysis:
-                fitrows+=analysis[0]
-                rises+=analysis[1]
-                inputs[f'p_{band}_{name}'],inputs[f'pcov_{band}_{name}']=analysis[2],analysis[4]
+            rises+=_object_rises(a,reps,name,band)
             records.append(tab)
-            inputs[f'keep_{band}_{name}']=keep
         me=np.quantile(properties.loc[valid,'LOGMBH'],np.linspace(0,1,4))
         ee=np.quantile(properties.loc[valid,'LOGLEDD_RATIO'],np.linspace(0,1,4))
         for i in range(3):
@@ -576,25 +426,21 @@ def _object_groups(selected, output, fitrows, rises):
                 if keep.sum()<20:
                     continue
                 a=acc[keep]
-                tab,reps=_object_summary(a,z[keep],lum[keep],n_boot=2000,seed=4400+100*bi+3*i+j)
+                tab,reps=_object_summary(a,z[keep],lum[keep],*bootstrap_plan(band,f'grid_{i}_{j}'))
                 tab['grid'],tab['i_mbh'],tab['j_edd'],tab['band']='q3x3',i,j,band
                 tab['mbh_lo'],tab['mbh_hi'],tab['edd_lo'],tab['edd_hi']=me[i],me[i+1],ee[j],ee[j+1]
                 tab=tab.rename(columns={'sf_mag':'sf_raw_mag','sf_lo_mag':'sf_raw_lo_mag',
                                         'sf_hi_mag':'sf_raw_hi_mag','sf_err_mag':'sf_raw_err_mag'})
-                analysis=_object_fit(a,reps,f'grid_{i}_{j}',band,tuple(v[keep] for v in kernel))
-                if analysis:
-                    fitrows+=analysis[0]
-                    rises+=analysis[1]
+                rises+=_object_rises(a,reps,f'grid_{i}_{j}',band)
                 grid_records.append(tab)
     pd.DataFrame(matching).to_csv(output/'structure_function_group_matching.csv',index=False)
     pd.concat(records,ignore_index=True).to_csv(output/'structure_function_matched_mbh_edd.csv',index=False)
     pd.concat(grid_records,ignore_index=True).to_csv(output/'structure_function_mbh_edd_grid.csv',index=False)
-    return inputs
 
 
 def object_first_refit():
     import shutil
-    from plate_completeness import ADOPTED_SELECTION, load_completeness_lightcurves
+    from plate_completeness import ADOPTED_SELECTION
     output=esf.CACHE/'object_first'
     with np.load(output/'object_accumulator.npz') as f:
         acc,ids=f['acc'],f['ids'].astype(str)
@@ -602,73 +448,37 @@ def object_first_refit():
     sample['OBJID']=sample.OBJID.astype(str)
     cats=sample[sample.band.eq('g')].set_index('OBJID').reindex(ids)
     z,lum=cats.z.to_numpy(float),cats.loglbol.to_numpy(float)
-    zmap=pd.Series(z,index=ids)
     with np.load(output/'ensemble_sf_covariance.npz') as f:
         boot={k:f[k] for k in f.files}
-    oldrises=pd.read_csv(output/'structure_function_object_rises.csv')
-    selected,available,figure,fitrows,rises,checks={},{},{},[],[],[]
+    selected,available,rises={},{},[]
     for bi,band in enumerate(BANDS):
         oid=boot[f'objids_{band}'].astype(str)
         indices=pd.Index(ids).get_indexer(oid)
         assert (indices>=0).all()
         reps=boot[f'replicates_{band}']
         a=acc[indices,bi,:reps.shape[1]]
-        if f'lag_nodes_{band}' not in boot:
-            nt=esf.clean_nightly(load_completeness_lightcurves(oid).query('band == @band'))[0]
-            kernel=_object_lag_kernel(nt,oid,zmap,a.shape[1])
-            np.testing.assert_array_equal(kernel[2],a[...,0])
-            for key,value in zip(['nodes','weights','counts'],kernel):
-                boot[f'lag_{key}_{band}']=value
-            np.savez_compressed(output/'ensemble_sf_covariance.npz',**boot)
-        kernel=tuple(boot[f'lag_{key}_{band}'] for key in ['nodes','weights','counts'])
-        fr,rr,p,_,pcov=_object_fit(a,reps,'fixed',band,kernel)
-        fitrows+=fr
-        for row in rr:
-            previous=oldrises[oldrises['sample'].eq('fixed')&oldrises.band.eq(band)&np.isclose(oldrises.lag_center_days,row['lag_center_days'])].iloc[0]
-            row['rise_plate_jack_sigma']=previous.rise_plate_jack_sigma
-        rises+=rr
+        rises+=_object_rises(a,reps,'fixed',band)
         available[band]=sample[sample.band.eq(band)].set_index('OBJID').reindex(ids)[ADOPTED_SELECTION[band]].fillna(False).to_numpy(bool)
-        selected[band]=(a,oid,z[indices],lum[indices],ADOPTED_SELECTION[band],kernel)
-        figure[f'p_{band}_fixed'],figure[f'pcov_{band}_fixed']=p,pcov
-        nd,wt,counts=kernel
-        coarse_w=wt.reshape(*wt.shape[:-1],16,2).sum(axis=-1)
-        coarse_n=np.divide((nd*wt).reshape(*wt.shape[:-1],16,2).sum(axis=-1),coarse_w,
-                           out=np.zeros_like(coarse_w),where=coarse_w>0)
-        coarse=(coarse_n,coarse_w,counts)
-        fine_drw,fine_pl,_=_object_sampled_models(kernel)
-        coarse_drw,coarse_pl,_=_object_sampled_models(coarse)
-        for row in fr:
-            if row['model'] not in ['drw_short','drw_all','powerlaw_all']:
-                continue
-            par=[row['amplitude'],row['timescale_or_slope']]
-            fm,cm,center=(fine_pl,coarse_pl,powerlaw) if row['model']=='powerlaw_all' else (fine_drw,coarse_drw,drw)
-            x=CENTERS[:a.shape[1]]
-            checks.append(dict(band=band,model=row['model'],max_16_32_difference_mag=float(abs(fm(x,*par)-cm(x,*par)).max()),
-                               max_center_sampled_difference_mag=float(abs(fm(x,*par)-center(x,*par)).max()),
-                               subdivisions=32))
-        print(f'{band}: sampled-lag DRW {p}; kernel verified against all pair counts',flush=True)
-    figure|=_object_groups(selected,output,fitrows,rises)
-    pd.DataFrame(fitrows).to_csv(output/'structure_function_object_fits.csv',index=False)
+        selected[band]=(a,oid,z[indices],lum[indices],ADOPTED_SELECTION[band])
+    _object_groups(selected,output,rises)
     pd.DataFrame(rises).to_csv(output/'structure_function_object_rises.csv',index=False)
-    pd.DataFrame(checks).to_csv(output/'structure_function_lag_integration_check.csv',index=False)
     rows=[dict(band=band,lag_center_days=c,n_objects=int(u.sum()),z_med=np.median(z[u]) if u.any() else np.nan)
           for bi,band in enumerate(BANDS) for c,u in zip(CENTERS,(available[band][:,None]&(acc[:,bi,:,0]>0)).T)]
     pd.DataFrame(rows).to_csv(output/'structure_function_varying_membership_redshift.csv',index=False)
-    np.savez_compressed(esf.cache_path('object_first/figure_inputs.npz'),**figure)
-    for name in ['structure_function_object_fits.csv','structure_function_object_rises.csv',
-                 'structure_function_lag_integration_check.csv','structure_function_matched_mbh_edd.csv',
+    for name in ['structure_function_object_rises.csv','structure_function_matched_mbh_edd.csv',
                  'structure_function_mbh_edd_grid.csv','structure_function_group_matching.csv',
                  'structure_function_varying_membership_redshift.csv','ensemble_sf_covariance.npz']:
         shutil.copy2(output/name,_ROOT/'data'/name)
-    print('Sampled-lag refit complete; empirical SF and selected objects unchanged',flush=True)
 
 
 if __name__ == "__main__":
     esf.check_flags(__file__)
     import sys
-    if "--object-first" in sys.argv or len(sys.argv) == 1:
+    if "--object-first" in sys.argv:
         object_first_results()
     elif "--refit-object-first" in sys.argv:
         object_first_refit()
     elif "--literature-choices" in sys.argv:
         literature_choices()
+    else:
+        raise SystemExit("usage: --object-first | --refit-object-first | --literature-choices")

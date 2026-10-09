@@ -4,10 +4,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.integrate import quad
-from scipy.interpolate import CubicSpline, RegularGridInterpolator
+from scipy.interpolate import RegularGridInterpolator
 from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize_scalar
-from scipy.stats import chi2, norm
+from scipy.stats import chi2, f as fdist, norm
 
 import ensemble_structure_function as esf
 import fit_structure_function as fsf
@@ -17,6 +17,7 @@ OUT = ROOT / 'data'
 LOGX = np.linspace(-6, 6, 481)
 SLOPE_ALPHA = np.round(np.arange(-0.5, 2.901, 0.05), 8)
 ALPHA = SLOPE_ALPHA[SLOPE_ALPHA < 2]
+GROUPS = fsf.GROUPS
 
 
 def psd_sf2(x, alpha, beta):
@@ -43,12 +44,10 @@ def cached_grid(path, alphas, logx, f):
     return RegularGridInterpolator((alphas, logx), values, bounds_error=True)
 
 
-def psd_grid(beta=None):
-    if beta is None:
-        g = psd_grid(2.)
-        return RegularGridInterpolator((ALPHA, g.grid[1]), g.values[:len(ALPHA)], bounds_error=True)
-    return cached_grid(esf.cache_path(f'model_checks/psd_integrals_beta{beta:g}.npz'), SLOPE_ALPHA, LOGX[np.abs(LOGX) < 4.01],
-                       lambda x, a: psd_sf2(x, a, beta))
+def psd_grid():
+    g = cached_grid(esf.cache_path('model_checks/psd_integrals_beta2.npz'), SLOPE_ALPHA, LOGX[np.abs(LOGX) < 4.01],
+                    lambda x, a: psd_sf2(x, a, 2.))
+    return RegularGridInterpolator((ALPHA, g.grid[1]), g.values[:len(ALPHA)], bounds_error=True)
 
 
 def samples():
@@ -69,6 +68,8 @@ def samples():
             raise ValueError('Missing fiducial accumulator objects')
         nb = boot[f'replicates_{band}'].shape[1]
         a = object_data[f'fiducial_acc_{band}'][pos,:nb]
+        if not np.array_equal(a[...,0],boot[f'lag_counts_{band}']):
+            raise ValueError('sampling and ensemble archives disagree')
         p = prop.reindex(oid).copy()
         p['z'] = catalog[catalog.band.eq(band)].set_index('OBJID').reindex(oid).z
         kernel = tuple(boot[f'lag_{key}_{band}'] for key in ['nodes','weights','counts'])
@@ -91,70 +92,75 @@ def samples():
             yield band,name,a[keep],p.iloc[np.flatnonzero(keep)],tuple(v[keep] for v in kernel)
 
 
-def covariance(reps, rho=None):
+def adopted_reps(band, name, a):
+    return fsf._object_amplitude(esf.object_bootstrap(a, *fsf.bootstrap_plan(band, name))[1])
+
+
+def covariance(reps):
     sd = np.std(reps,axis=0,ddof=1)
-    corr,_,s = esf.ledoit_wolf(reps/sd)
-    if rho is not None:
-        corr = (1-rho)*s+rho*np.trace(s)/len(s)*np.eye(len(s))
-    return corr*np.outer(sd,sd)
+    return esf.ledoit_wolf(reps/sd)[0]*np.outer(sd,sd)
 
 
-def fit_psd(a, kernel, grid, seed, start=fsf.PLATEAU_MIN_D, beta=2., rho=None):
-    alphas,(lo,hi) = grid.grid[0],grid.grid[1][[0,-1]]
-    values = esf.object_second_moments(a)
-    sf = np.sqrt(np.maximum(values.mean(axis=0),0))
-    _,reps2 = esf.object_bootstrap(a,n_boot=5000,seed=seed)
-    reps = np.sqrt(np.maximum(reps2,0))
-    use = (fsf.CENTERS[:len(sf)] >= start) & (sf > 0)
-    cov = covariance(reps[:,use],rho)
-    factor = cho_factor(cov)
-    y = sf[use]
-    cy = cho_solve(factor,y)
-    nodes,weights = kernel[:2]
-    weight = weights.mean(axis=0)[use]
-    node = np.divide((nodes*weights).mean(axis=0)[use],weight,
-                     out=np.ones_like(weight),where=weight>0)
-    lognode = np.log10(node)
-    def trial(logtau,alpha):
-        if alpha == 0 and beta == 2:
-            shape = -np.expm1(-node/10**logtau)
-        else:
-            x = np.clip(lognode-logtau,lo,hi)
-            shape = grid(np.stack([np.full(x.size,alpha),x.ravel()],axis=1)).reshape(x.shape)
-        u = np.sqrt((weight*shape).sum(axis=1))
-        cu = cho_solve(factor,u)
-        amp = (u@cy)/(u@cu)
-        r = y-amp*u
-        return float(r@cho_solve(factor,r)),amp,amp*u
+def all_bin_fits(a, grid, reps):
+    sf = np.sqrt(np.maximum(esf.object_second_moments(a).mean(axis=0),0))
+    use = sf > 0
+    dt,y,n = fsf.CENTERS[:len(sf)][use],sf[use],int(use.sum())
+    err,C = reps[:,use].std(axis=0,ddof=1),covariance(reps[:,use])
+    w,full,long = err**-2,cho_factor(C),dt > fsf.LONG_MIN_D
+    prec = np.sqrt(np.diag(cho_solve(full,np.eye(n))))
+    lo,hi = grid.grid[1][[0,-1]]
+    shape = lambda t,alpha:np.sqrt(-np.expm1(-dt/10**t) if alpha == 0 else
+                                   grid(np.column_stack([np.full(n,alpha),np.clip(np.log10(dt)-t,lo,hi)])))
+    def trial(t,alpha):
+        u = shape(t,alpha)
+        amp = (w*u)@y/((w*u)@u)
+        return float(w@(y-amp*u)**2),amp
     def profile(alpha):
         ts = np.linspace(1,5,65)
-        costs = np.array([trial(t,alpha)[0] for t in ts])
-        k = costs.argmin()
-        best = minimize_scalar(lambda t:trial(t,alpha)[0],
-                               bounds=(ts[max(k-1,0)],ts[min(k+1,len(ts)-1)]),method='bounded')
-        candidates = [best.x,ts[0],ts[-1]]
-        t = min(candidates,key=lambda q:trial(q,alpha)[0])
-        cost,amp,pred = trial(t,alpha)
-        return dict(alpha=float(alpha),chi2=cost,tau_days=10**t,sf_inf_mag=amp),pred
-    profiles = [profile(alpha)[0] for alpha in alphas]
-    best = min(profiles,key=lambda d:d['chi2'])
-    drw,pred_drw = profile(0.)
-    _,pred_bend = profile(best['alpha'])
-    rows=[]
-    for model,result,npar in [('drw',drw,2),('bending_psd',best,3)]:
-        ndof = int(use.sum())-npar
-        accepted = [p['alpha'] for p in profiles if p['chi2'] <= best['chi2']+1] if npar==3 else []
-        rows.append(dict(model=model,**result,n_bins=int(use.sum()),dof=ndof,
-                         reduced_chi2=result['chi2']/ndof,pvalue=chi2.sf(result['chi2'],ndof),
-                         delta_chi2_from_drw=drw['chi2']-result['chi2'],
-                         alpha_profile_lo=min(accepted) if accepted else np.nan,
-                         alpha_profile_hi=max(accepted) if accepted else np.nan,
-                         alpha_boundary=model=='bending_psd' and best['alpha'] in [alphas[0],alphas[-1]],
-                         alpha_profile_truncated=bool(accepted) and (min(accepted)==alphas[0] or max(accepted)==alphas[-1]),
-                         tau_boundary=result['tau_days'] < 10.01 or result['tau_days'] > 99990))
-    curves = pd.DataFrame(dict(lag_center_days=fsf.CENTERS[:len(sf)][use],sf_mag=y,
-                               sf_err_mag=np.sqrt(np.diag(cov)),drw_mag=pred_drw,bending_mag=pred_bend))
-    return rows,profiles,curves
+        k = int(np.argmin([trial(t,alpha)[0] for t in ts]))
+        best = minimize_scalar(lambda t:trial(t,alpha)[0],bounds=(ts[max(k-1,0)],ts[min(k+1,len(ts)-1)]),method='bounded')
+        t = min([best.x,ts[0],ts[-1]],key=lambda q:trial(q,alpha)[0])
+        cost,amp = trial(t,alpha)
+        return dict(alpha=float(alpha),chi2=cost,logtau=t,amp=amp)
+    profiles = [profile(x) for x in ALPHA]
+    fits,resid = {},[]
+    for name,prof in [('drw',[profiles[int(np.flatnonzero(ALPHA == 0)[0])]]),('bending_psd',profiles)]:
+        p = min(prof,key=lambda q:q['chi2'])
+        free,tau = len(prof) > 1,10**p['logtau']
+        model = lambda q:q[0]*shape(q[1],p['alpha'])
+        q = np.array([p['amp'],p['logtau']])
+        J = np.column_stack([(model(q+d)-model(q-d))/(2*d.sum()) for d in np.diag([1e-6*q[0],1e-5])])
+        A = np.linalg.solve(J.T@(w[:,None]*J),(w[:,None]*J).T)
+        P = A@C@A.T
+        e = np.sqrt(np.diag(P))
+        accepted = [x['alpha'] for x in prof if x['chi2'] <= p['chi2']+1] if free else []
+        k = 2+free
+        pred = model(q)
+        r = y-pred
+        ci = cho_solve(full,r)
+        x2 = r@ci
+        row = fits[name] = dict(model=name,n_bins=n,n_params=k,dof=n-k,chi2_diag=p['chi2'],reduced_chi2_diag=p['chi2']/(n-k),
+            chi2_full=x2,reduced_chi2_full=x2/(n-k),pvalue_full=chi2.sf(x2,n-k),sf_inf_mag=p['amp'],sf_inf_err_mag=e[0],
+            tau_days=tau,tau_err_days=tau*np.log(10)*e[1],alpha=p['alpha']+0.,alpha_profile_lo=min(accepted,default=np.nan),
+            alpha_profile_hi=max(accepted,default=np.nan),alpha_boundary=free and p['alpha'] in ALPHA[[0,-1]],
+            alpha_profile_truncated=bool(accepted) and (min(accepted)==ALPHA[0] or max(accepted)==ALPHA[-1]),
+            tau_boundary=tau < 10.01 or tau > 99990)
+        if not free:
+            R = np.eye(n)-J@A
+            cr = R@C@R.T+(max(x2/(n-k),1.)-1)*J@P@J.T
+            x = float(r[long]@np.linalg.solve(cr[np.ix_(long,long)],r[long]))
+            pl = chi2.sf(x,long.sum())
+            row.update(final_lag_days=dt[-1],final_resid_mag=r[-1],long_n_bins=int(long.sum()),
+                       final_resid_err_mag_param_scaled=np.sqrt(cr[-1,-1]),final_sigma_param_scaled=r[-1]/np.sqrt(cr[-1,-1]),
+                       long_chi2_param_scaled=x,long_pvalue_param_scaled=pl,long_sigma_param_scaled=norm.isf(pl/2))
+        resid += [dict(model=name,lag_center_days=t,sf_mag=v,sf_err_mag=s,model_mag=m,relative_residual=v/m-1,
+                       relative_residual_err=s/m,chi2_contribution=c2,conditional_pull=pull)
+                  for t,v,s,m,c2,pull in zip(dt,y,err,pred,r*ci,ci/prec)]
+    B = fits['bending_psd']
+    d = fits['drw']['chi2_diag']-B['chi2_diag']
+    pv,pf = chi2.sf(d,1),fdist.sf(d/max(B['reduced_chi2_diag'],1.),1,B['dof'])
+    B.update(vs_drw_delta_chi2=d,vs_drw_pvalue=pv,vs_drw_sigma=norm.isf(pv/2),vs_drw_f_pvalue=pf,vs_drw_f_sigma=norm.isf(pf/2))
+    return list(fits.values()),resid
 
 
 def nested_checks(a, prop, seed):
@@ -213,25 +219,10 @@ def nested_checks(a, prop, seed):
     return out,properties,curves
 
 
-def influence(a,prop):
-    values=esf.object_second_moments(a)
-    sf=np.sqrt(np.maximum(values.mean(axis=0),0))
-    leave=np.sqrt(np.maximum((values.sum(axis=0)-values)/(len(a)-1),0))
-    out=[]
-    for k in np.flatnonzero(fsf.CENTERS[:len(sf)] > fsf.SHORT_MAX_D):
-        for i,oid in enumerate(prop.index):
-            out.append(dict(OBJID=oid,lag_center_days=fsf.CENTERS[k],n_objects=len(a),
-                            object_sf2_mag2=values[i,k],sf_mag=sf[k],
-                            leave_one_out_sf_mag=leave[i,k],change_mag=leave[i,k]-sf[k],
-                            z=prop.z.iloc[i],logmbh=prop.LOGMBH.iloc[i],logedd=prop.LOGLEDD_RATIO.iloc[i]))
-    return out
-
-
-def greedy(a,kernel,stat,steps=2,key=lambda s:s):
-    keep,path=np.ones(len(a),bool),[(-1,stat(a,kernel))]
+def greedy(a,stat,steps=2,key=lambda s:s):
+    keep,path=np.ones(len(a),bool),[(-1,stat(a))]
     for _ in range(steps):
-        trial={i:stat(a[m],tuple(x[m] for x in kernel))
-               for i in np.flatnonzero(keep) for m in [keep&(np.arange(len(a))!=i)]}
+        trial={i:stat(a[keep&(np.arange(len(a))!=i)]) for i in np.flatnonzero(keep)}
         i=min(trial,key=lambda i:key(trial[i]))
         keep[i]=False
         path.append((i,trial[i]))
@@ -239,31 +230,19 @@ def greedy(a,kernel,stat,steps=2,key=lambda s:s):
 
 
 def lowmass_influence():
-    from plate_completeness import load_completeness_lightcurves
-    groups,rows=['lowmbh_lowedd','lowmbh_highedd'],[]
-    for band,name,a,prop,kernel in samples():
-        if name not in groups:
+    grid,rows=psd_grid(),[]
+    keys=['final_resid_mag','final_resid_err_mag_param_scaled','final_sigma_param_scaled','long_sigma_param_scaled']
+    for band,name,a,prop,_ in samples():
+        if name not in GROUPS[:2]:
             continue
         ids=prop.index.to_numpy(str)
-        def endpoint(a,kernel):
-            reps=np.sqrt(np.maximum(esf.object_bootstrap(a,n_boot=3000,
-                                                         seed=3300+10*esf.BANDS.index(band)+groups.index(name))[1],0))
-            e=[r for r in fsf._object_fit(a,reps,name,band,kernel)[0] if r['model']=='drw_extrapolation'][-1]
-            return e['lag_center_days'],e['excess_mag'],e['excess_err_mag']
-        (_,(lag,x,e)),*drops=greedy(a,kernel,endpoint,key=lambda s:s[1]/s[2])
-        row=dict(band=band,sample=name,n_objects=len(a),lag_center_days=lag,excess_mag=x,excess_err_mag=e,sigma=x/e)
-        for n,(i,(_,dx,de)) in enumerate(drops,1):
-            row.update({f'drop{n}_objid':ids[i],f'drop{n}_excess_mag':dx,
-                        f'drop{n}_excess_err_mag':de,f'drop{n}_sigma':dx/de})
-        nt=esf.clean_nightly(load_completeness_lightcurves(ids).query('band == @band'))[0]
-        err,nplates,theta,active=fsf._object_plate_jackknife(nt,ids,prop.z,a,band)
-        k=int(np.argmin(abs(fsf.CENTERS-lag)))
-        on=active[:,k]
-        i=np.argmin(theta[on,k])
-        change=theta[on,k][i]-np.sqrt(max(esf.object_second_moments(a)[:,k].mean(),0))
-        rows.append(dict(row,plate_jack_sigma_mag=err[k],n_plates=nplates[k],
-                         drop_plate=np.sort(nt.loc[nt.sss,'plate'].unique())[on][i],
-                         drop_plate_change_mag=change,drop_plate_sigma=(x+change)/e))
+        def drw(a):
+            return next(f for f in all_bin_fits(a,grid,adopted_reps(band,name,a))[0] if f['model']=='drw')
+        (_,f),*drops=greedy(a,drw,key=lambda f:f['long_sigma_param_scaled'])
+        row=dict(band=band,sample=name,n_objects=len(a),final_lag_days=f['final_lag_days'],long_n_bins=f['long_n_bins'],**{k:f[k] for k in keys})
+        for n,(i,d) in enumerate(drops,1):
+            row.update({f'drop{n}_objid':ids[i],**{f'drop{n}_{k}':d[k] for k in keys}})
+        rows.append(row)
     result=pd.DataFrame(rows)
     result.to_csv(OUT/'structure_function_lowmass_influence.csv',index=False)
     print(result.to_string(index=False))
@@ -283,21 +262,6 @@ def band_ratio():
     pd.DataFrame(dict(lag_center_days=fsf.CENTERS[:len(sf_g)],n_objects=len(common),sf_g_mag=sf_g,sf_r_mag=sf_r,
                       ratio=sf_r/sf_g,ratio_lo=lo,ratio_hi=hi,macleod_ratio_short=w**(b_sf-b_tau/2),
                       macleod_ratio_long=w**b_sf)).to_csv(OUT/'structure_function_band_ratio.csv',index=False)
-
-
-def drw_growth():
-    fit=pd.read_csv(OUT/'structure_function_object_fits.csv').query('sample == "fixed" and model == "drw_short"').set_index('band')
-    rows=[]
-    with np.load(OUT/'ensemble_sf_covariance.npz') as f:
-        for band in esf.BANDS:
-            kernel=f[f'lag_nodes_{band}'],f[f'lag_weights_{band}']
-            lag=fsf.CENTERS[[int(np.argmin(abs(fsf.CENTERS-2371))),kernel[0].shape[1]-1]]
-            tau=fit.timescale_or_slope[band]
-            sf=fsf._object_sampled_models(kernel)[0](lag,fit.amplitude[band],tau)
-            rows.append(dict(band=band,anchor_lag_days=lag[0],endpoint_lag_days=lag[1],tau_days=tau,
-                             drw_anchor_mag=sf[0],drw_endpoint_mag=sf[1],growth_percent=100*(sf[1]/sf[0]-1),
-                             endpoint_over_tau=lag[1]/tau))
-    pd.DataFrame(rows).to_csv(OUT/'structure_function_drw_growth.csv',index=False)
 
 
 def group_trends():
@@ -372,25 +336,16 @@ def star_floor(lo, hi, n_boot=2000, seed=930):
 def fit_range():
     from plate_completeness import load_completeness_lightcurves
     C, ccd = fsf.CENTERS, ['sdss', 'ps1', 'ztf']
-    subs = ['lowmbh_lowedd', 'lowmbh_highedd', 'highmbh_lowedd', 'highmbh_highedd']
-    with np.load(OUT/'ensemble_sf_covariance.npz') as f:
-        reps = {b: f[f'replicates_{b}'] for b in esf.BANDS}
     with np.load(OUT/'structure_function_sampling_covariance.npz') as f:
         pairs = {b: f[f'fiducial_asymmetry_acc_{b}'][:, :2, 0, :, 0] for b in esf.BANDS}
-    fid, sub = {}, {}
-    for index, (band, name, a, prop, kernel) in enumerate(samples()):
-        if name == 'fiducial':
-            fid[band] = a, reps[band], kernel, prop, index
-        elif name in subs:
-            r = esf.object_bootstrap(a, n_boot=3000, seed=3300+10*esf.BANDS.index(band)+subs.index(name))[1]
-            sub[band, name] = a, np.sqrt(np.maximum(r, 0)), kernel
+    fid = {band: (a, adopted_reps(band, name, a), prop) for band, name, a, prop, _ in samples() if name == 'fiducial'}
     ref = pd.read_parquet(OUT/'plate_completeness_sample.parquet').astype({'OBJID': str}).set_index(['band', 'OBJID']).reference_mag
-    mags = {b: ref[b].reindex(fid[b][3].index) for b in esf.BANDS}
+    mags = {b: ref[b].reindex(fid[b][2].index) for b in esf.BANDS}
     stars = star_floor({b: m.min() for b, m in mags.items()}, {b: m.max() for b, m in mags.items()})
     noise = pd.read_csv(OUT/'structure_function_noise_fraction.csv').set_index(['band', 'bin']).noise_over_sf2
     rows = []
     for b in esf.BANDS:
-        a, r, kernel, prop, _ = fid[b]
+        a, r, prop = fid[b]
         nb, ids = a.shape[1], prop.index.to_numpy(str)
         nt = esf.clean_nightly(load_completeness_lightcurves(ids))[0].query('band == @b')
         coef = []
@@ -412,58 +367,9 @@ def fit_range():
     fl = pd.DataFrame(rows)
     wide = lambda c: fl.pivot(index='bin', columns='band', values=c)
     end = int(np.flatnonzero(wide('ccd_pair_fraction_object').ge(.99).all(axis=1).to_numpy())[-1])
-    def start(col, bands=esf.BANDS):
-        fail = np.flatnonzero(~wide(col)[list(bands)].abs().lt(1).all(axis=1).to_numpy()[:end+1])
-        return C[fail[-1]+1 if len(fail) else 0]
-    grid, out = psd_grid(), []
-    last = lambda fit: next(x for x in reversed(fit[0]) if x['model'] == 'drw_extrapolation')
-    for b in esf.BANDS:
-        a, r, kernel, _, index = fid[b]
-        drw, _, jac = fsf._object_sampled_models(kernel)
-        y, dt = np.sqrt(esf.ensemble_second_moment(a)), C[:a.shape[1]]
-        def record(model, i, j, n, p, e, rc, ex, err, **extra):
-            m = np.sqrt(drw(dt, *p[:2])**2+(p[2] if len(p) > 2 else 0))
-            out.append(dict(band=b, model=model, start_days=C[i], end_days=C[j], n_bins=n, dof=n-len(p),
-                            sf_inf_mag=p[0], sf_inf_err_mag=e[0], tau_days=p[1], tau_err_days=e[1],
-                            **dict(zip(['floor_mag2', 'floor_err_mag2'], [*p[2:], *e[2:]])), reduced_chi2=rc,
-                            end_resid_mag2=y[j]**2-m[j]**2, final_lag_days=dt[-1], final_excess_mag=ex,
-                            final_excess_err_mag=err, final_excess_sigma=ex/err, **extra))
-        for i in (3, 4, 5, 6, 7):
-            psd = {x['model']: x for x in fit_psd(a, kernel, grid, 928+index, C[i])[0]}
-            same = dict(same_bin_drw_reduced_chi2=psd['drw']['reduced_chi2'],
-                        same_bin_free_reduced_chi2=psd['bending_psd']['reduced_chi2'],
-                        same_bin_alpha=psd['bending_psd']['alpha'], same_bin_delta_chi2=psd['bending_psd']['delta_chi2_from_drw'])
-            for j in (9, 10):
-                fit = fsf._object_fit(a, r, 'fixed', b, kernel, (C[i], C[j]))
-                if fit is None:
-                    continue
-                s, e = fit[0][0], last(fit)
-                for name in subs:
-                    q = fsf._object_fit(*sub[b, name][:2], name, b, sub[b, name][2], (C[i], C[j]))
-                    x = last(q) if q else dict(excess_mag=np.nan, excess_err_mag=np.nan)
-                    same[f'{name}_excess_mag'], same[f'{name}_sigma'] = x['excess_mag'], x['excess_mag']/x['excess_err_mag']
-                record('drw', i, j, s['n_bins'], fit[2], [s['amplitude_err'], s['timescale_or_slope_err']],
-                       s['reduced_chi2'], e['excess_mag'], e['excess_err_mag'], **same)
-        cov = fsf._object_fit(a, r, 'fixed', b, kernel)[3]
-        model = lambda x, A, t, c: np.sqrt(drw(x, A, t)**2+c)
-        for j in (9, 10):
-            m = dt <= C[j]
-            p, e, pc, rc = min((fsf.fit(model, dt[m], y[m], cov[np.ix_(m, m)], [y[m].max(), t, 0.], ([1e-3, 1., -5e-3], [3., 1e6, 5e-3]))
-                                for t in fsf.GLS_TAU0), key=lambda q: q[3])
-            M = model(dt, *p)
-            J = np.column_stack([jac(dt, *p[:2])*(drw(dt, *p[:2])/M)[:, None], .5/M])
-            err = np.sqrt(fsf._extrapolation_cov(cov, m, J, pc, rc)[-1, -1])
-            record('drw_floor', 0, j, int(m.sum()), p, e, rc, y[-1]-M[-1], err)
-    fits = pd.DataFrame(out)
-    fits.to_csv(OUT/'structure_function_fit_range.csv', index=False)
-    q = fits[fits.model.eq('drw_floor') & fits.end_days.eq(C[end])].set_index('band')
-    c, ce = (q.loc[fl.band, k].to_numpy() for k in ['floor_mag2', 'floor_err_mag2'])
-    shift = lambda x: fl.sf_mag-np.sqrt(fl.sf_mag**2-x)
-    fl = fl.assign(quasar_floor_mag2=c, quasar_floor_err_mag2=ce, quasar_shift_mag=shift(c), quasar_shift_over_sigma=shift(c)/fl.sf_err_mag,
-                   quasar_shift_over_sigma_lo=shift(c-ce)/fl.sf_err_mag, quasar_shift_over_sigma_hi=shift(c+ce)/fl.sf_err_mag)
-    fl.assign(criterion_start_days=start('shift_over_sigma'), criterion_end_days=C[end],
-              quasar_criterion_start_days=fl.band.map({b: start('quasar_shift_over_sigma', b) for b in esf.BANDS}),
-              quasar_criterion_start_joint_days=start('quasar_shift_over_sigma')).to_csv(OUT/'structure_function_fit_range_floor.csv', index=False)
+    fail = np.flatnonzero(~wide('shift_over_sigma').abs().lt(1).all(axis=1).to_numpy()[:end+1])
+    fl.assign(criterion_start_days=C[fail[-1]+1 if len(fail) else 0], criterion_end_days=C[end]).to_csv(
+        OUT/'structure_function_fit_range_floor.csv', index=False)
 
 
 REJECT_SIGMA = (3., 4., 5., 7., 10., np.inf)
@@ -529,11 +435,11 @@ def rejection():
     cols = ['variant', 'threshold_sigma', 'n_restored', 'band', 'bin', 'lag_center_days', 'n_objects', 'n_pairs', 'sf_mag',
             'sf_lo_mag', 'sf_hi_mag', 'sf_err_mag', 'rise_mag', 'rise_lo_mag', 'rise_hi_mag', 'rise_bootstrap_sigma']
     keep = lambda d, t: d[np.abs(d.res) <= t*d.rob]
-    for bi, b in enumerate(esf.BANDS):
+    for b in esf.BANDS:
         d, nb = q[q.band.eq(b)], reps[b].shape[1]
         z, lum = (prop[c].reindex(ids[b]).to_numpy(float) for c in ('z', 'loglbol'))
         def sf(x, variant, t=esf.CLIP_SIGMA, n=np.nan):
-            s, r = fsf._object_summary(esf.accumulate(x, ids[b], prop.z, bands=[b], resid=True)[:, 0, :nb], z, lum, seed=1927+bi)
+            s, r = fsf._object_summary(esf.accumulate(x, ids[b], prop.z, bands=[b], resid=True)[:, 0, :nb], z, lum, *fsf.bootstrap_plan(b, 'fiducial'))
             dr = r-r[:, [k0]]
             rows.append(s.assign(variant=variant, threshold_sigma=t, n_restored=n, band=b, bin=np.arange(nb),
                                  rise_mag=s.sf_mag-s.sf_mag[k0], rise_lo_mag=np.percentile(dr, 16, 0),
@@ -555,152 +461,6 @@ def rejection():
     np.testing.assert_allclose(adopted[cols[8:11]], fixed[cols[8:11]], rtol=1e-9)
     np.testing.assert_allclose(adopted[adopted.bin > k0][cols[12:]], rises[cols[12:]], rtol=1e-9)
     table.to_csv(OUT/'structure_function_rejection_sensitivity.csv', index=False)
-
-
-def population_drw_grid(kernel, amplitude, tau, logscale, scatter=True, order=16):
-    nodes, weights = kernel[:2]
-    sa, st = fsf.POPDRW_SIG if scatter else (0., 0.)
-    va, vt, cv = .64*sa**2+.16*st**2, .16*sa**2+.64*st**2, .32*(st**2-sa**2)
-    x, w = np.polynomial.hermite.hermgauss(order if scatter else 1)
-    multiplier = np.exp(2*cv*np.log(10)**2+np.sqrt(2*vt)*np.log(10)*x)
-    normalization = amplitude**2*np.exp(2*va*np.log(10)**2)
-    values = []
-    for scale in np.atleast_1d(logscale):
-        q = nodes[..., None]/(tau[:, None, None, None]*10**scale*multiplier)
-        v = (-np.expm1(-q)*w/np.sqrt(np.pi)).sum(axis=-1)
-        values.append(normalization[:, None]*(v*weights).sum(axis=2))
-    return np.stack(values, axis=-1)
-
-
-def population_drw_fit(grid, logscale, values, cov, short):
-    curve = CubicSpline(logscale, grid, axis=-1)
-    inv = np.linalg.inv(cov[np.ix_(short, short)])
-    y = values[short]
-    def profile(t):
-        h = np.sqrt(curve(t))[short]
-        amplitude = (h@inv@y)/(h@inv@h)
-        r = y-amplitude*h
-        return float(r@inv@r), amplitude
-    loss = np.array([profile(t)[0] for t in logscale])
-    i = int(loss.argmin())
-    if i in (0, len(logscale)-1):
-        raise ValueError('Population DRW timescale fit reaches the evaluation boundary')
-    result = minimize_scalar(lambda t: profile(t)[0], bounds=logscale[[i-1, i+1]],
-                             method='bounded', options={'xatol':1e-10})
-    if not result.success:
-        raise RuntimeError(result.message)
-    t = result.x
-    x2, amplitude = profile(t)
-    if amplitude <= 0:
-        raise ValueError('Nonpositive population DRW amplitude')
-    shape = np.sqrt(curve(t))
-    jac = np.column_stack([shape, amplitude*curve(t, 1)/(2*shape)])
-    pc = np.linalg.inv(jac[short].T@inv@jac[short])
-    return np.array([amplitude, t]), amplitude*shape, pc, jac, x2/(short.sum()-2)
-
-
-def population_properties():
-    from astropy import units as u
-    from astropy.coordinates import SkyCoord
-    x = pd.read_fwf(OUT/'macleod2012_southcat.dat',colspecs=[(0,7),(9,19),(22,31),(40,47),(49,56),(58,64)],
-                    names=['DBID','catalog_ra','catalog_dec','Mi_z0','Mi_z2','catalog_z'])
-    archive = np.load(OUT/'ensemble_sf_covariance.npz')
-    ids = np.unique(np.concatenate([archive[f'objids_{b}'].astype(str) for b in esf.BANDS]))
-    cat = pd.read_parquet(OUT/'S82/Catalog.parquet').assign(OBJID=lambda q:q.objectId.astype(str)).set_index('OBJID').loc[ids]
-    j,separation,_ = SkyCoord(cat.RA.to_numpy()*u.deg,cat.DEC.to_numpy()*u.deg).match_to_catalog_sky(
-        SkyCoord(x.catalog_ra.to_numpy()*u.deg,x.catalog_dec.to_numpy()*u.deg))
-    q = x.iloc[j].reset_index(drop=True)
-    q['OBJID'],q['separation_arcsec'],q['z_current'] = ids,separation.arcsec,cat.Z_DR16Q.to_numpy()
-    q['matched'],q['source'] = separation.arcsec<1,'MacLeod2012_southcat'
-    for column in ['Mi_z0','Mi_z2']:
-        q[column] = q[column].where(q.matched & q[column].lt(-10))
-    q['DBID'] = q.DBID.where(q.matched).astype('Int64')
-    q.to_csv(OUT/'structure_function_population_properties.csv',index=False)
-    return q.set_index('OBJID')
-
-
-def population_drw_test():
-    properties = population_properties()
-    archive = np.load(OUT/'ensemble_sf_covariance.npz')
-    logscale = np.linspace(-3, 3, 181)
-    fits, curves, objects = [], [], []
-    for bi, (band, name, a, prop, kernel) in enumerate(q for q in samples() if q[1]=='fiducial'):
-        matched = properties.reindex(prop.index)[['Mi_z0','Mi_z2']].notna().all(axis=1).to_numpy()
-        relation = [('macleod_population','Mi_z0',fsf.POPDRW_COEF),
-                    ('suberlak_population','Mi_z2',{'sfinf':(-.476,-.479,.118,.118),'tau':(2.597,.17,.035,.141)})]
-        models = [('single_full',np.ones(len(a)),np.full(len(a),300.),False,np.ones(len(a),bool)),
-                  ('single',np.ones(matched.sum()),np.full(matched.sum(),300.),False,matched)]
-        for label,column,coefficients in relation:
-            pp = prop.loc[matched]
-            mi = properties.reindex(pp.index)[column].to_numpy(float)
-            predictors = np.column_stack([np.ones(len(pp)),np.log10(fsf.POPDRW_LAM_OBS[band]/(1+pp.z)/4000),
-                                          mi+23,pp.LOGMBH-9])
-            amp0,tau0 = [10**(predictors@coefficients[c]) for c in ['sfinf','tau']]
-            models.append((label,amp0,tau0,True,matched))
-            objects.extend(dict(OBJID=o,band=band,model=label,Mi=m,magnitude_convention=column,
-                logmbh=b,z=z,sfinf_mag=s,tau_days=t)
-                for o,m,b,z,s,t in zip(pp.index,mi,pp.LOGMBH,pp.z,amp0,tau0))
-        moments = esf.object_second_moments(a)
-        dt = fsf.CENTERS[:a.shape[1]]
-        short = fsf.plateau_bins(dt)
-        long = dt > fsf.LONG_MIN_D
-        nboot = len(archive[f'replicates_{band}'])
-        ids = np.random.default_rng(1927+bi).integers(0,len(a),(nboot,len(a)))
-        counts = np.zeros((nboot,len(a)))
-        np.add.at(counts,(np.arange(nboot)[:,None],ids),1)
-        np.testing.assert_allclose(np.sqrt(counts@moments/len(a)),archive[f'replicates_{band}'],rtol=1e-12,atol=1e-12)
-        for label,amplitude,tau,scatter,mask in models:
-            local_kernel = tuple(k[mask] for k in kernel)
-            n = int(mask.sum())
-            y = np.sqrt(moments[mask].mean(axis=0))
-            count = counts[:,mask]
-            count /= count.sum(axis=1)[:,None]
-            reps = np.sqrt(count@moments[mask])
-            sd = reps.std(axis=0,ddof=1)
-            corr,_,_ = fsf.ledoit_wolf(reps/sd)
-            cov = corr*np.outer(sd,sd)
-            table = population_drw_grid(local_kernel,amplitude,tau,logscale,scatter)
-            mean = table.mean(axis=0)
-            unscaled = np.sqrt(mean[:, np.argmin(abs(logscale))])
-            par, predicted, pc, jac, rc = population_drw_fit(mean,logscale,y,cov,short)
-            exact = population_drw_grid(local_kernel,amplitude,tau,[par[1]],scatter,32).mean(axis=0)[:,0]
-            integration_error = np.max(abs(par[0]*np.sqrt(exact)-predicted))
-            if integration_error > 1e-6:
-                raise ValueError(f'Population quadrature/interpolation error {integration_error}')
-            print(f'{band} {label}: short scales {par}, chi2/df {rc:.3f}, endpoint {predicted[-1]:.6f} versus {y[-1]:.6f}',flush=True)
-            weighted = (count@table.reshape(n,-1)).reshape(nboot,*mean.shape)
-            parameters, residuals = [], []
-            for r, (data, model) in enumerate(zip(reps,weighted)):
-                p, fitted, _, _, _ = population_drw_fit(model,logscale,data,cov,short)
-                parameters.append(p)
-                residuals.append(data-fitted)
-            residuals, parameters = np.asarray(residuals), np.asarray(parameters)
-            empirical = np.cov(residuals,rowvar=False)
-            extra = (max(rc,1)-1)*jac@pc@jac.T
-            residual = y-predicted
-            summary = dict(band=band,model=label,n_objects=n,n_parent_objects=len(a),n_bootstrap=nboot,n_fit_bins=int(short.sum()),
-                amplitude_scale=par[0],timescale_scale=10**par[1],reduced_chi2_short=rc,
-                integration_error_mag=integration_error,fit_min_days=dt[short].min(),fit_max_days=dt[short].max(),
-                chi2_short=rc*(short.sum()-2),dof_short=int(short.sum()-2),n_bootstrap_failed=0,n_bootstrap_boundary=0)
-            for inflation, S in [('unscaled',empirical),('fit_scaled',empirical+extra)]:
-                r = residual[long]
-                x2 = float(r@np.linalg.solve(S[np.ix_(long,long)],r))
-                probability = chi2.sf(x2,int(long.sum()))
-                fits.append(dict(**summary,uncertainty=inflation,joint_chi2=x2,n_long_bins=int(long.sum()),
-                    gaussian_p=probability,gaussian_sigma=norm.isf(probability/2),final_prediction_mag=predicted[-1],
-                    final_excess_mag=residual[-1],final_excess_err_mag=np.sqrt(S[-1,-1]),
-                    amplitude_lo95=np.percentile(parameters[:,0],2.5),amplitude_hi95=np.percentile(parameters[:,0],97.5),
-                    timescale_lo95=10**np.percentile(parameters[:,1],2.5),timescale_hi95=10**np.percentile(parameters[:,1],97.5)))
-                for k in range(len(y)):
-                    curves.append(dict(band=band,model=label,uncertainty=inflation,lag_days=dt[k],in_fit=bool(short[k]),
-                        observed_mag=y[k],prediction_mag=predicted[k],unscaled_prediction_mag=unscaled[k],
-                        residual_mag=residual[k],residual_sd_mag=np.sqrt(S[k,k])))
-            np.savez_compressed(esf.cache_path(f'model_checks/population_drw_{band}_{label}.npz'),parameters=parameters,residuals=residuals,
-                                covariance=empirical,extra_covariance=extra)
-            print(f'{band} {label}: {par}, short chi2/df {rc:.3f}, long sigma {fits[-1]["gaussian_sigma"]:.3f}',flush=True)
-    pd.DataFrame(fits).to_csv(OUT/'structure_function_population_fits.csv',index=False)
-    pd.DataFrame(curves).to_csv(OUT/'structure_function_population_curves.csv',index=False)
-    pd.DataFrame(objects).to_csv(OUT/'structure_function_population_objects.csv',index=False)
 
 
 def fiducial_nightly():
@@ -730,7 +490,7 @@ def replace_plate_epochs(n, rng, variant):
     return n.assign(mag=out)
 
 
-def plate_replacement(n_rep=200, n_boot=5000):
+def plate_replacement(n_rep=200):
     fixed = pd.read_csv(OUT/'structure_function_fixed_population.csv').query('sample == "fixed"')
     with np.load(OUT/'ensemble_sf_covariance.npz') as f:
         adopted = {b: f[f'replicates_{b}'] for b in esf.BANDS}
@@ -742,7 +502,7 @@ def plate_replacement(n_rep=200, n_boot=5000):
         for d in draws.values():
             np.testing.assert_array_equal(d[..., fixed_slots], np.broadcast_to(real[..., fixed_slots], d[..., fixed_slots].shape))
         stack = np.stack([real, *(d.mean(axis=0) for d in draws.values())], axis=1)
-        bounds, boot = (np.sqrt(np.maximum(x, 0)) for x in esf.object_bootstrap(stack, n_boot=n_boot, seed=1927+bi))
+        bounds, boot = (np.sqrt(np.maximum(x, 0)) for x in esf.object_bootstrap(stack, *fsf.bootstrap_plan(band, 'fiducial')))
         sf = np.sqrt(np.maximum(esf.ensemble_second_moment(stack), 0))
         tab = fixed[fixed.band.eq(band)]
         np.testing.assert_allclose(boot[:, 0], adopted[band], rtol=1e-12)
@@ -771,29 +531,21 @@ def plate_replacement(n_rep=200, n_boot=5000):
 
 def main():
     grid=psd_grid()
-    fits,profiles,curves,narrow,properties,narrow_curves,influences=[],[],[],[],[],[],[]
-    for index,(band,name,a,prop,kernel) in enumerate(samples()):
+    narrow,properties,narrow_curves,all_fits,all_resid=[],[],[],[],[]
+    for index,(band,name,a,prop,_) in enumerate(samples()):
         print(f'{band} {name}: {len(a)} objects',flush=True)
-        rows,pp,cc=fit_psd(a,kernel,grid,928+index)
-        for row in rows:
-            row.update(band=band,sample=name,n_objects=len(a))
-        fits.extend(rows)
-        profiles.extend([dict(band=band,sample=name,**p) for p in pp])
-        curves.append(cc.assign(band=band,sample=name))
+        ff,rr=all_bin_fits(a,grid,adopted_reps(band,name,a))
+        all_fits+=[{'band':band,'sample':name,'n_objects':len(a),**x} for x in ff]
+        all_resid+=[{'band':band,'sample':name,**x} for x in rr]
         nr,pr,nc=nested_checks(a,prop,2928+index)
         narrow.extend([dict(band=band,sample=name,**p) for p in nr])
         properties.extend([dict(band=band,sample=name,**p) for p in pr])
         narrow_curves.extend([dict(band=band,sample=name,**p) for p in nc])
-        if band=='r' and name in ['grid_0_2','grid_1_2']:
-            influences.extend([dict(band=band,sample=name,**p) for p in influence(a,prop)])
-    pd.DataFrame(fits).to_csv(OUT/'structure_function_psd_fits.csv',index=False)
-    pd.DataFrame(profiles).to_csv(OUT/'structure_function_psd_profiles.csv',index=False)
-    pd.concat(curves,ignore_index=True).to_csv(OUT/'structure_function_psd_curves.csv',index=False)
     pd.DataFrame(narrow).to_csv(OUT/'structure_function_narrowing_checks.csv',index=False)
     pd.DataFrame(properties).to_csv(OUT/'structure_function_narrowing_properties.csv',index=False)
     pd.DataFrame(narrow_curves).to_csv(OUT/'structure_function_narrowing_curves.csv',index=False)
-    pd.DataFrame(influences).to_csv(OUT/'structure_function_high_edd_influence.csv',index=False)
-
+    pd.DataFrame(all_fits).to_csv(OUT/'structure_function_all_bin_fits.csv',index=False)
+    pd.DataFrame(all_resid).to_csv(OUT/'structure_function_all_bin_residuals.csv',index=False)
 
 if __name__ == '__main__':
     esf.check_flags(__file__)
@@ -801,8 +553,6 @@ if __name__ == '__main__':
         lowmass_influence()
     elif '--band-ratio' in sys.argv:
         band_ratio()
-    elif '--drw-growth' in sys.argv:
-        drw_growth()
     elif '--group-trends' in sys.argv:
         group_trends()
     elif '--noise-fraction' in sys.argv:
@@ -811,8 +561,6 @@ if __name__ == '__main__':
         fit_range()
     elif '--rejection' in sys.argv:
         rejection()
-    elif '--population-drw' in sys.argv:
-        population_drw_test()
     elif '--plate-replacement' in sys.argv:
         plate_replacement()
     else:

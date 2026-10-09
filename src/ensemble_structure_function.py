@@ -2,6 +2,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Literal
 import ast
+import hashlib
 import re
 import sys
 
@@ -29,6 +30,11 @@ if not (np.isclose(EDGES[k], 10**3.5) and np.isclose(EDGES[k + 1], 10**3.75)):
     raise AssertionError("rest-frame lag binning check failed")
 
 LC_PARQUET = "data/S82/total_lightcurves.parquet"
+
+
+def digest(path: Path) -> str:
+    with open(path, "rb") as f:
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
 def cache_path(name: str) -> Path:
@@ -136,8 +142,7 @@ def floor_variance(nightly: pd.DataFrame, col: str = "sf2_mag2") -> pd.DataFrame
     tab = tab.assign(survey_a=tab.native_a.map(names), survey_b=tab.native_b.map(names))
     tab = tab.rename(columns={"residual_variance": "sf2_mag2", "training_floor_se": "sf2_jack_err"})
     if nightly.band.eq("i").any():
-        old = pd.read_csv(_ROOT / "data/plate_pair_residual_variance.csv")
-        tab = pd.concat([tab, old[old.survey_a.eq("SERC-I") | old.survey_b.eq("SERC-I")]], ignore_index=True)
+        raise ValueError("no residual-variance table for band i")
     sss = nightly["sss"].to_numpy(dtype=bool)
     ref = (nightly[~sss].groupby(["OBJID", "band"], observed=True)["mag"].median()
            .reindex(pd.MultiIndex.from_arrays([nightly["OBJID"], nightly["band"]])).to_numpy(float))

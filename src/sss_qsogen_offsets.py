@@ -51,13 +51,8 @@ def _native_sed_row(args):
 
 
 def _native_control_bands():
-    from plate_magnitude_models import NATIVE_ALPHA
-
     bands = {b: read_bandpass(f) for b, f in dict(bj="serc-j.txt", r="iiiaf_og590.txt",
              e="possi-e.txt", tp="techpan_og590.txt", g="SLOAN_SDSS.g.dat", r_sdss="SLOAN_SDSS.r.dat").items()}
-    for b in ("bj", "e", "tp"):
-        w, t = bands[b]
-        bands[b] = w, t * (w / np.average(w, weights=t)) ** NATIVE_ALPHA[b]
     vega = {b: ab_minus_vega(*bands[b]) for b in ("bj", "r", "e", "tp")}
     return bands, vega
 

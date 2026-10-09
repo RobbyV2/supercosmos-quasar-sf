@@ -10,6 +10,7 @@ import pandas as pd
 import assemble_lightcurves as al
 import ensemble_structure_function as esf
 import star_null_structure_function as sn
+from stellar_sed_calibration import SED_CHI2_MAX
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +18,6 @@ NATIVE_WORK = ROOT / "temp/native_sed_calibration"
 NATIVE_BASE = NATIVE_WORK
 NATIVE_VARIANT = "primary"
 NATIVE_BAND = {"SERC-J/EJ": "bj", "SERC-R/AAO-R": "r", "POSSI-E(S)": "e"}
-NATIVE_ALPHA = {"bj": 2, "e": 0, "r": 0, "tp": 0}
 
 
 FIELD_NAMES=("fx","fy","frr","fx2_y2","fxy")
@@ -71,15 +71,17 @@ def native_inverse(raw, xi, eta, p):
     return np.where(supported, m, np.nan), derivative, supported
 
 
+def star_fold(star):
+    return np.asarray(star, np.int64) * 2654435761 % 5
+
+
 def native_inputs():
     stars = pd.read_parquet(ROOT / "data/standard_star_sed.parquet").set_index("star")
     stars=stars.join(pd.read_parquet(ROOT/"data/standard_star_sed_response.parquet").set_index("star"),validate="one_to_one")
+    stars["fit_ok"]&=stars.chi2<SED_CHI2_MAX
     if NATIVE_VARIANT != "primary":
         for band in ("bj", "r", "e", "tp"):
-            variant=NATIVE_VARIANT
-            if variant=="effective":
-                variant={-1:"energy",0:"primary",1:"tilt1",2:"tilt2"}[NATIVE_ALPHA[band]]
-            column = f"{band}_native_{variant}_shift"
+            column = f"{band}_native_{NATIVE_VARIANT}_shift"
             if column in stars:
                 stars[band+"_native"] += stars[column]
         if NATIVE_VARIANT=="effective":
@@ -92,7 +94,7 @@ def native_inputs():
     det = det[det.SURVEYNAME.isin(NATIVE_BAND)].copy()
     det["native"] = det.SURVEYNAME.map(NATIVE_BAND)
     det.loc[det.plate.isin((131900,131903)),"native"] = "tp"
-    det["band"] = det.SURVEYNAME.map(sn.SURVEY_SDSS_BAND)
+    det["band"] = det.SURVEYNAME.map(al.SURVEY_SDSS_BAND)
     native = np.where(det.possi, "R1", det.bi.map(al._SSS_BI_BAND))
     det = det[al.saturation_mask(det.SMAG.to_numpy(), native)].copy()
     x = stars.reindex(det.star)
@@ -104,7 +106,7 @@ def native_inputs():
     for key, suffix in (("expected", "_native"), ("expected_error", "_native_err")):
         det[key] = np.select([det.native.eq(b) for b in ("bj","r","e","tp")],
                              [x[b+suffix].to_numpy() for b in ("bj","r","e","tp")],default=np.nan)
-    det["fold"] = (det.star.to_numpy(np.int64)*2654435761) % 5
+    det["fold"] = star_fold(det.star)
     det["xi"], det["eta"] = al.field_coords(det.plate.to_numpy(), det.ra.to_numpy(), det.dec.to_numpy())
     return stars, det.reset_index(drop=True)
 
@@ -113,7 +115,7 @@ def native_calibration():
     NATIVE_WORK.mkdir(exist_ok=True, parents=True)
     stars, det = native_inputs()
     coefficients, validation, held, coverage = [], [], [], []
-    folds = (stars.index.to_numpy(np.int64)*2654435761) % 5
+    folds = star_fold(stars.index)
     eligible = stars.fit_ok.to_numpy(bool) & (folds != 4)
     centers = al.plate_centres()
     for plate, d in det.groupby("plate", sort=True):
@@ -129,7 +131,6 @@ def native_calibration():
         column = d.native.iloc[0]+"_native"
         expected = stars[column].to_numpy()
         edges = np.arange(13., 23.26, .25)
-        mid = (edges[:-1]+edges[1:])/2
         total = np.histogram(expected[inside], edges)[0]
         seen = np.histogram(d.loc[train & d.star.isin(stars.index[inside]), "expected"], edges)[0]
         rate = np.divide(seen,total,out=np.zeros(len(total),float),where=total>0)
@@ -213,6 +214,13 @@ def native_calibration():
         sha256={str(p.relative_to(ROOT)):hashlib.file_digest(p.open("rb"),"sha256").hexdigest() for p in inputs}),indent=2)+"\n")
 
 
+def raw_quasars():
+    raw = al.assign_group_ids_by_sky(al.sss_raw())
+    mapping = al.match_groups_to_catalog(raw, str(ROOT/"data/S82/Catalog.parquet"))
+    q = al.drop_blended_parents(raw.drop(columns=["OBJID","z"],errors="ignore").merge(mapping,on="GROUP_ID",how="inner"))
+    return q[al.saturation_mask(q.SMAG.to_numpy(),np.where(q.SURVEYNAME.eq("POSSI-E(S)"),"R1",q.BAND_NATIVE))]
+
+
 def native_quasars():
     from astropy.table import Table
     from astropy.coordinates import SkyCoord
@@ -222,16 +230,13 @@ def native_quasars():
     if cache.exists():
         q = pd.read_parquet(cache)
     else:
-        raw = al.assign_group_ids_by_sky(al.sss_raw())
-        mapping = al.match_groups_to_catalog(raw, str(ROOT/"data/S82/Catalog.parquet"))
-        q = al.drop_blended_parents(raw.drop(columns=["OBJID","z"],errors="ignore").merge(mapping,on="GROUP_ID",how="inner"))
+        q = raw_quasars()
         q = q[q.SURVEYNAME.isin(NATIVE_BAND)].copy()
-        q = q[al.saturation_mask(q.SMAG.to_numpy(),np.where(q.SURVEYNAME.eq("POSSI-E(S)"),"R1",q.BAND_NATIVE))]
         q.to_parquet(cache,index=False)
     q["OBJID"] = q.OBJID.astype(str)
     q["native"] = q.SURVEYNAME.map(NATIVE_BAND)
     q.loc[q.PLATEID.isin((131900,131903)),"native"] = "tp"
-    q["band"] = q.SURVEYNAME.map(sn.SURVEY_SDSS_BAND)
+    q["band"] = q.SURVEYNAME.map(al.SURVEY_SDSS_BAND)
     coefficients = pd.read_csv(NATIVE_WORK/"coefficients.csv").set_index("plate")
     xi,eta = al.field_coords(q.PLATEID.to_numpy(),q.RA.to_numpy(),q.DEC.to_numpy())
     q["native_mag"],q["response_derivative"],q["supported"] = np.nan,np.nan,False
@@ -263,9 +268,6 @@ def native_quasars():
             bands[b]=(w,t/w)
     if NATIVE_VARIANT == "effective":
         bands["r"]=al.read_bandpass("iiiaf_og590.txt")
-        for b in ("bj","r","e","tp"):
-            w,t=bands[b]
-            bands[b]=(w,t*(w/np.average(w,weights=t))**NATIVE_ALPHA[b])
     vega={b:al.ab_minus_vega(*bands[b]) for b in ("bj","r","e","tp")}
     terms=[]
     for obj,p in objects.iterrows():
@@ -457,6 +459,21 @@ def native_noise():
     print(noise.to_string(index=False))
 
 
+def native_products(work):
+    floor=pd.read_csv(work/"pair_variance_validation.csv")
+    q=pd.read_parquet(work/"quasar_epochs.parquet")
+    q["calibration_supported"]=q.supported
+    q["error_supported"],q["magerr"]=False,np.nan
+    noise=pd.read_csv(work/"random_errors.csv")
+    for native,g in noise.groupby("native"):
+        use=q.native.eq(native)
+        q.loc[use,"magerr"]=np.sqrt(np.interp(q.loc[use,"native_mag"],(g.mag_lo+g.mag_hi)/2,g.variance))
+        q.loc[use,"error_supported"]=q.loc[use,"native_mag"].between(g.mag_lo.min(),g.mag_hi.max())
+    q["supported"]=q.calibration_supported&q.error_supported&np.isfinite(q.mag+q.magerr)&q.magerr.gt(0)
+    q["support_reason"]=np.where(q.supported,"supported",np.where(q.calibration_supported,"random-error range","instrumental response or stellar footprint"))
+    return floor[floor.subset.eq("training")&floor.boundary_sigma_min.eq(3)].drop_duplicates("class_id"),q
+
+
 def native_publish():
     if NATIVE_VARIANT!="effective":raise ValueError("Only the validated effective responses are adopted")
     mapping={"coefficients.csv":"plate_native_calibration.csv","random_errors.csv":"plate_native_random_errors.csv",
@@ -464,19 +481,8 @@ def native_publish():
         "random_error_validation.csv":"plate_native_random_error_validation.csv",
         "pair_variance_validation.csv":"plate_native_pair_variance_validation.csv","coverage.csv":"plate_native_coverage.csv"}
     for source,target in mapping.items():shutil.copy2(NATIVE_WORK/source,ROOT/"data"/target)
-    floor=pd.read_csv(NATIVE_WORK/"pair_variance_validation.csv")
-    floor=floor[floor.subset.eq("training")&floor.boundary_sigma_min.eq(3)].drop_duplicates("class_id")
+    floor,q=native_products(NATIVE_WORK)
     floor.to_csv(ROOT/"data/plate_native_pair_variance.csv",index=False)
-    q=pd.read_parquet(NATIVE_WORK/"quasar_epochs.parquet")
-    q["calibration_supported"]=q.supported
-    q["error_supported"],q["magerr"]=False,np.nan
-    noise=pd.read_csv(NATIVE_WORK/"random_errors.csv")
-    for native,g in noise.groupby("native"):
-        use=q.native.eq(native)
-        q.loc[use,"magerr"]=np.sqrt(np.interp(q.loc[use,"native_mag"],(g.mag_lo+g.mag_hi)/2,g.variance))
-        q.loc[use,"error_supported"]=q.loc[use,"native_mag"].between(g.mag_lo.min(),g.mag_hi.max())
-    q["supported"]=q.calibration_supported&q.error_supported&np.isfinite(q.mag+q.magerr)&q.magerr.gt(0)
-    q["support_reason"]=np.where(q.supported,"supported",np.where(q.calibration_supported,"random-error range","instrumental response or stellar footprint"))
     q.to_parquet(ROOT/"data/plate_native_quasar_epochs.parquet",index=False)
     inputs=[ROOT/"src/plate_magnitude_models.py",ROOT/"src/stellar_sed_calibration.py",
         ROOT/"data/roe_stars.hdf5",ROOT/"data/wu_qso.hdf5",ROOT/"data/survey_table.fits",
@@ -497,13 +503,12 @@ def native_publish():
     print(q.groupby(["band","supported"]).size().to_string())
 
 
-def native_longform(radius=1.0,sat_cut=True):
-    if radius!=1.0 or not sat_cut:raise ValueError("Native calibration is validated for the adopted matching and saturation cuts")
-    q=pd.read_parquet(ROOT/"data/plate_native_quasar_epochs.parquet")
+def native_longform(q=None):
+    q=pd.read_parquet(ROOT/"data/plate_native_quasar_epochs.parquet") if q is None else q
     q=q[q.supported]
     return pd.DataFrame(dict(OBJID=q.OBJID.astype(str),band=q.band,time=q.MJD,mag=q.mag,magerr=q.magerr,
         survey=np.where(q.SURVEYNAME.eq("POSSI-E(S)"),"sss_possi","sss"),plate=q.PLATEID,
-        smag=q.SMAG,calib_ok=True,trunc_v=1.))
+        calib_ok=True,trunc_v=1.))
 
 
 def native_null():
@@ -709,7 +714,7 @@ def native_variant(variant,adopted):
 
 if __name__ == "__main__":
     esf.check_flags(__file__)
-    native_variant(sys.argv[sys.argv.index("--native-variant")+1] if "--native-variant" in sys.argv else None,
+    native_variant((sys.argv+[""])[sys.argv.index("--native-variant")+1] if "--native-variant" in sys.argv else None,
                    {"--native-floor-impact","--native-sed-impact"})
     if "--native-fit" in sys.argv:
         native_calibration()

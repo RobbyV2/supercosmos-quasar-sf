@@ -6,19 +6,20 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from astropy.io import fits
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ensemble_structure_function as esf
 from ensemble_structure_function import (BANDS, EDGES, CENTERS, NB, LC_PARQUET,
                                          condense_nightly, reject_outliers)
-from fit_structure_function import POPDRW_COEF, POPDRW_SIG, POPDRW_LAM_OBS
-from scipy.stats import norm
+from assemble_lightcurves import redshifts
 
 _ROOT = Path(__file__).resolve().parents[1]
 GRID_N = 1 << 19
 BATCH = 64
 SEED = 20260818
+ALL_BIN = {"drw": ("reduced_chi2_diag", "reduced_chi2_full", "final_sigma_param_scaled", "long_chi2_param_scaled",
+                   "long_sigma_param_scaled"),
+           "bending_psd": ("alpha", "vs_drw_delta_chi2", "vs_drw_sigma", "vs_drw_f_sigma")}
 
 
 def tk95(psd: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -44,43 +45,10 @@ def bending_psd(freq: np.ndarray, amp: np.ndarray, tau: np.ndarray, alpha: np.nd
     return s
 
 
-def popdrw_params(objids: np.ndarray, z: np.ndarray, rng: np.random.Generator
-                  ) -> tuple[np.ndarray, np.ndarray]:
-    cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet",
-                          columns=["objectId", "PLATE", "MJD", "FIBERID"])
-    cat = cat.assign(OBJID=cat["objectId"].astype(str)).set_index("OBJID").loc[objids]
-    with fits.open(_ROOT / "data/dr16q_prop_May01_2024.fits", memmap=True) as h:
-        d = h[1].data
-        prop = pd.DataFrame({k: d[k].astype(np.int64) for k in ["PLATE", "MJD", "FIBERID"]}
-                            | {k: d[k].astype(np.float64) for k in ["LOGMBH", "LOGLBOL"]})
-    key = cat.reset_index()[["OBJID", "PLATE", "MJD", "FIBERID"]].astype(
-        {"PLATE": np.int64, "MJD": np.int64, "FIBERID": np.int64})
-    m = key.merge(prop, on=["PLATE", "MJD", "FIBERID"], how="left").set_index("OBJID")
-    m = m[~m.index.duplicated()].loc[objids]
-    lbol, mbh = m["LOGLBOL"].to_numpy(float), m["LOGMBH"].to_numpy(float)
-    ok_l = np.isfinite(lbol) & (lbol > 43.0) & (lbol < 49.0)
-    mi = 90.0 - 2.5 * np.where(ok_l, lbol, np.nan)
-    mi = np.where(np.isfinite(mi), mi, np.nanmedian(mi))
-    ok_m = np.isfinite(mbh) & (mbh > 6.0) & (mbh < 12.0)
-    mbh = np.where(ok_m, mbh, 2.0 - 0.27 * mi)
-    eps_s = rng.standard_normal(len(objids)) * POPDRW_SIG[0]
-    eps_k = rng.standard_normal(len(objids)) * POPDRW_SIG[1]
-    sfinf = np.zeros((len(objids), len(BANDS)))
-    tau = np.zeros_like(sfinf)
-    for bi, b in enumerate(BANDS):
-        lam = np.log10(POPDRW_LAM_OBS[b] / (1.0 + z) / 4000.0)
-        A, B, C, D = POPDRW_COEF["sfinf"]
-        ls0 = A + B * lam + C * (mi + 23.0) + D * (mbh - 9.0)
-        A, B, C, D = POPDRW_COEF["tau"]
-        lt0 = A + B * lam + C * (mi + 23.0) + D * (mbh - 9.0)
-        sdr, kdr = ls0 - 0.5 * lt0 + eps_s, lt0 + 0.5 * ls0 + eps_k
-        sfinf[:, bi] = 10.0 ** (0.8 * sdr + 0.4 * kdr)
-        tau[:, bi] = 10.0 ** (0.8 * kdr - 0.4 * sdr)
-    print(f"popdrw draw: median SF_inf g {np.median(sfinf[:, 0]):.3f} r "
-          f"{np.median(sfinf[:, 1]):.3f} mag; median tau_rest g {np.median(tau[:, 0]):.0f} "
-          f"r {np.median(tau[:, 1]):.0f} d; LOGLBOL ok {int(ok_l.sum())} LOGMBH ok "
-          f"{int(ok_m.sum())} of {len(objids)}")
-    return sfinf, tau
+def all_bin(model: str) -> pd.DataFrame:
+    return (pd.read_csv(_ROOT / "data/structure_function_all_bin_fits.csv")
+            .query("sample == 'fiducial' and model == @model")
+            .set_index("band", verify_integrity=True).loc[list(BANDS)])
 
 
 def simulate_mags(lc: pd.DataFrame, objids: np.ndarray, z: np.ndarray, sfinf: np.ndarray,
@@ -107,7 +75,7 @@ def simulate_mags(lc: pd.DataFrame, objids: np.ndarray, z: np.ndarray, sfinf: np
     return out + rng.normal(0.0, lc["magerr"].to_numpy()) if add_noise else out
 
 
-def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17, inputs: bool = False,
+def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
                          long_n: int = 1 << 19, shapes: bool = True,
                          on_clipped: Callable[..., None] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sf_model_checks import psd_grid
@@ -115,8 +83,7 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17, inputs: bool =
     with np.load(_ROOT / "data/ensemble_sf_covariance.npz") as f:
         selected = {b: np.sort(f[f"objids_{b}"].astype(str)) for b in BANDS}
         nbands = {b: f[f"lag_counts_{b}"].shape[1] for b in BANDS}
-    cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet", columns=["objectId", "Z_DR16Q"])
-    zmap = cat.assign(OBJID=cat.objectId.astype(str)).set_index("OBJID").Z_DR16Q
+    zmap = redshifts()
     rng = np.random.default_rng(SEED + 27)
     for b in BANDS:
         print(f"fiducial {b}: {len(selected[b])} quasars through {CENTERS[nbands[b] - 1]:.0f} rest-frame days",
@@ -145,22 +112,17 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17, inputs: bool =
     amp_draw = np.clip(rng.normal(0, 0.2, len(objids)), -0.5, 0.5)
     tau_draw = np.clip(rng.normal(0, 0.35, len(objids)), -0.8, 0.8)
     flat = np.zeros(len(objids))
-    read = lambda name, query: pd.read_csv(_ROOT / "data" / name).query(query).set_index("band").loc[list(BANDS)]
-    fit = read("structure_function_object_fits.csv", "sample == 'fixed' and model == 'drw_short'")
+    fit = all_bin("drw")
     per = lambda d, v: np.outer(10 ** d, np.broadcast_to(v, len(BANDS)))
-    spread = lambda da, dtau, a=fit.amplitude, t=fit.timescale_or_slope: (per(da, a), per(dtau, t))
-    if inputs:
-        regimes = [("identical_tau600", "drw", grid_n, *spread(flat, flat, 0.3, 600.0), None),
-                   ("identical_tau3000", "drw", grid_n, *spread(flat, flat, 0.3, 3000.0), None),
-                   ("macleod2010", "drw", grid_n, *popdrw_params(objids, z, np.random.default_rng(SEED + 28)), None)]
-    else:
-        regimes = [("identical", "drw", grid_n, *spread(flat, flat), None),
-                   ("heterogeneous", "drw", grid_n, *spread(amp_draw, tau_draw), None),
-                   ("cadence_correlated", "drw", grid_n,
-                    *spread(np.sort(amp_draw)[np.argsort(np.argsort(density))], tau_draw), None)]
-    if shapes and not inputs:
-        bend = read("structure_function_psd_fits.csv", "sample == 'fiducial' and model == 'bending_psd'")
-        start = read("structure_function_fixed_population.csv", "sample == 'fixed' and 400 < lag_center_days < 450")
+    spread = lambda da, dtau, a=fit.sf_inf_mag, t=fit.tau_days: (per(da, a), per(dtau, t))
+    regimes = [("identical", "drw", grid_n, *spread(flat, flat), None),
+               ("heterogeneous", "drw", grid_n, *spread(amp_draw, tau_draw), None),
+               ("cadence_correlated", "drw", grid_n,
+                *spread(np.sort(amp_draw)[np.argsort(np.argsort(density))], tau_draw), None)]
+    if shapes:
+        bend = all_bin("bending_psd")
+        start = (pd.read_csv(_ROOT / "data/structure_function_fixed_population.csv")
+                 .query("sample == 'fixed' and 400 < lag_center_days < 450").set_index("band").loc[list(BANDS)])
         regimes += [("identical", psd, n, *spread(flat, flat, a, t), per(flat, alpha)) for n in (grid_n, long_n)
                     for psd, a, t, alpha in (("bending", bend.sf_inf_mag, bend.tau_days, bend.alpha),
                                              ("power_law", np.sqrt(4 / np.pi) * start.sf_mag,
@@ -222,7 +184,7 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17, inputs: bool =
                             coverage.append(dict(band=b, bin=k, covered=bounds[0, k] <= target[k] <= bounds[2, k],
                                                  width_mag2=bounds[2, k] - bounds[0, k]))
                     if on_clipped:
-                        on_clipped(regime, realization, acc, clipped, objids, zmap)
+                        on_clipped(regime, realization, acc, objids)
             if realization == 0 or (realization + 1) % 8 == 0:
                 print(f"aggregation {regime} {psd} grid {n} {realization + 1}/{n_real}, "
                       f"elapsed {time.monotonic() - started:.1f} s", flush=True)
@@ -252,49 +214,50 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17, inputs: bool =
 
 
 def drw_excess_null(n_real: int = 64) -> pd.DataFrame:
-    from fit_structure_function import _object_amplitude, _object_fit, _object_lag_kernel
+    from sf_model_checks import adopted_reps, all_bin_fits, psd_grid
+    grid = psd_grid()
+    cols = [f"{m}_{k}" for m, keys in ALL_BIN.items() for k in keys]
+    measured = pd.concat([all_bin(m)[list(keys)].add_prefix(f"{m}_") for m, keys in ALL_BIN.items()], axis=1)
     with np.load(_ROOT / "data/ensemble_sf_covariance.npz") as f:
-        data = {b: (f[f"objids_{b}"].astype(str), f[f"replicates_{b}"]) for b in BANDS}
-    rows, store = [], {b: [] for b in BANDS}
+        fiducial = {b: (f[f"objids_{b}"].astype(str), f[f"lag_counts_{b}"].shape[1]) for b in BANDS}
+    rows = []
+    started = time.monotonic()
 
-    def excess(regime, covariance, realization, band, a, reps, kernel):
-        fits = pd.DataFrame(_object_fit(a, reps, regime, band, kernel, short_only=True)[0]).set_index("model")
-        short, joint = fits.loc["drw_short"], fits.loc["drw_joint_extrapolation"]
-        final = fits.loc[["drw_extrapolation"]].iloc[-1]
-        rows.append(dict(regime=regime, covariance=covariance, band=band, realization=realization,
-                         sf_inf_mag=short.amplitude, tau_days=short.timescale_or_slope,
-                         reduced_chi2=short.reduced_chi2, final_lag_days=final.lag_center_days,
-                         final_sf_mag=_object_amplitude(esf.ensemble_second_moment(a))[-1],
-                         final_excess_mag=final.excess_mag, final_excess_err_mag=final.excess_err_mag,
-                         final_sigma=final.excess_mag / final.excess_err_mag, joint_n_bins=int(joint.n_bins),
-                         joint_chi2=joint.chi2, joint_sigma=norm.isf(joint.pvalue / 2)))
-
-    def on_clipped(regime, realization, acc, frame, objids, zmap):
+    def on_clipped(regime, realization, acc, objids):
+        new = []
         for bi, b in enumerate(BANDS):
-            ids, replicates = data[b]
-            keep = np.isin(objids, ids)
-            a = acc[keep, bi, :replicates.shape[1]]
-            kernel = _object_lag_kernel(frame[frame.band.eq(b)], objids[keep], zmap, a.shape[1])
-            np.testing.assert_array_equal(kernel[2], a[..., 0])
-            boot = _object_amplitude(esf.object_bootstrap(a, n_boot=5000, seed=1927 + bi)[1])
-            for covariance, reps in (("data", replicates), ("bootstrap", boot)):
-                excess(regime, covariance, realization, b, a, reps, kernel)
-            store[b].append((a, kernel))
-            if realization == n_real - 1:
-                spread = np.stack([_object_amplitude(esf.ensemble_second_moment(x)) for x, _ in store[b]])
-                for i, (x, k) in enumerate(store[b]):
-                    excess(regime, "realizations", i, b, x, spread, k)
-                store[b].clear()
+            ids, nb = fiducial[b]
+            a = acc[np.isin(objids, ids), bi, :nb]
+            fits = pd.DataFrame(all_bin_fits(a, grid, adopted_reps(b, "fiducial", a))[0]).set_index("model")
+            new.append(dict(regime=regime, band=b, realization=realization,
+                            **{f"{m}_{k}": fits.at[m, k] for m, keys in ALL_BIN.items() for k in keys}))
+        rows.extend(new)
+        print(f"excess null {regime} {realization + 1}/{n_real}, DRW long sigma "
+              + " ".join(f"{r['band']} {r['drw_long_sigma_param_scaled']:.2f}" for r in new)
+              + f", elapsed {time.monotonic() - started:.0f} s", flush=True)
 
     aggregation_recovery(n_real, shapes=False, on_clipped=on_clipped)
-    return pd.DataFrame(rows)
+    d = pd.DataFrame(rows)
+    by = d.groupby(["regime", "band"], sort=False)[cols]
+    hit = d[cols].ge(measured.loc[d.band].to_numpy())
+    both = hit.groupby([d.regime, d.realization], sort=False).all().groupby(level=0, sort=False).sum()
+    k = pd.concat([hit.groupby([d.regime, d.band], sort=False).sum(),
+                   both.assign(band="joint").set_index("band", append=True)])
+    mean = by.mean()
+    summary = pd.concat({"mean": mean, "sd": by.std(), "median": by.median(), "p95": by.quantile(0.95),
+                         "max": by.max(), "measured": measured.loc[mean.index.get_level_values("band")].set_axis(mean.index),
+                         "n_at_or_above": k, "p_empirical": (k + 1) / (n_real + 1)}, names=["summary"])
+    out = pd.concat([d, summary.reset_index()], ignore_index=True)
+    return out.astype({"realization": "Int64"})[["regime", "band", "realization", "summary", *cols]]
 
 
 if __name__ == "__main__":
     esf.check_flags(__file__)
     if "--excess-null" in sys.argv:
         drw_excess_null(64).to_csv(_ROOT / "data/structure_function_drw_excess_null.csv", index=False)
-    elif "--aggregation-test" in sys.argv or len(sys.argv) == 1:
+    elif "--aggregation-test" in sys.argv:
         output, draws = aggregation_recovery(64, 1 << 17)
         output.to_csv(_ROOT / "data/structure_function_aggregation_recovery.csv", index=False)
         draws.to_csv(_ROOT / "temp/structure_function_aggregation_draws.csv", index=False)
+    else:
+        raise SystemExit("usage: --aggregation-test | --excess-null")
