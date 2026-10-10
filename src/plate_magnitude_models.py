@@ -10,7 +10,7 @@ import pandas as pd
 import assemble_lightcurves as al
 import ensemble_structure_function as esf
 import star_null_structure_function as sn
-from stellar_sed_calibration import SED_CHI2_MAX
+from stellar_sed_calibration import SED_CHI2_MAX, bj_response
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,6 +85,7 @@ def native_inputs():
             if column in stars:
                 stars[band+"_native"] += stars[column]
         if NATIVE_VARIANT=="effective":
+            stars["bj_native"]+=stars.bj_native_factor_shift
             stars["r_native"]+=stars.r_native_og590_shift
             stars["r_native_err"]=stars.r_native_og590_err
     if not stars.index.is_unique:
@@ -268,6 +269,7 @@ def native_quasars():
             bands[b]=(w,t/w)
     if NATIVE_VARIANT == "effective":
         bands["r"]=al.read_bandpass("iiiaf_og590.txt")
+        bands["bj"]=bj_response()
     vega={b:al.ab_minus_vega(*bands[b]) for b in ("bj","r","e","tp")}
     terms=[]
     for obj,p in objects.iterrows():

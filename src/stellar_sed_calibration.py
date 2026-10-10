@@ -21,6 +21,7 @@ BANDS = dict(zip("ugriz", [f"SLOAN_SDSS.{b}.dat" for b in "ugriz"]))
 BANDS.update(bj="serc-j.txt", r_native="serc-r.txt", e="possi-e.txt", tp="techpan_og590.txt")
 EBV = np.arange(0., .551, .005)
 SED_CHI2_MAX = 25.
+BJ_RESPONSE_POWER = 2.
 PASSBAND_URLS = dict(
     parker="https://www.cambridge.org/core/services/aop-cambridge-core/content/view/878CF0C11CE7BC44BCA9294637F46981/S132335800000597Xa.pdf/the-introduction-of-tech-pan-film-at-the-uk-schmidt-telescope.pdf",
     schott="https://www.schott.com/-/media/project/onex/products/o/optical-filter-glass/downloads/schott-datasheet-collection-filter-en_112019.pdf?rev=766d730fb2ac41fd82165f3f74ee7ae3")
@@ -96,12 +97,19 @@ def _weights(wave: np.ndarray, wf: np.ndarray, tf: np.ndarray) -> np.ndarray:
             + np.bincount(ix + 1, weights * frac, minlength=len(wave)))
 
 
-def model_grid(energy: bool = False, og590: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def bj_response() -> tuple[np.ndarray, np.ndarray]:
+    w, t = al.read_bandpass(BANDS["bj"])
+    return w, t * (w / np.sqrt(w.min() * w.max())) ** BJ_RESPONSE_POWER
+
+
+def model_grid(energy: bool = False, og590: bool = False, bj_factor: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     path = DATA / "bosz/synthetic_photometry.npz"
     key = "magnitudes_energy" if energy else "magnitudes"
     vkey = "vega_energy" if energy else "vega"
     if og590:
         key, vkey = "magnitudes_og590", "vega_og590"
+    if bj_factor:
+        key, vkey = "magnitudes_bj_factor", "vega_bj_factor"
     if path.exists():
         d = np.load(path)
         if key in d:
@@ -116,6 +124,8 @@ def model_grid(energy: bool = False, og590: bool = False) -> tuple[np.ndarray, n
         filters[6] = al.read_bandpass("iiiaf_og590.txt")
     elif energy:
         filters = [(w, t / w) if 5 <= j <= 7 else (w, t) for j, (w, t) in enumerate(filters)]
+    elif bj_factor:
+        filters[5] = bj_response()
     weights = np.stack([_weights(wave, *f) for f in filters])
     vega = np.array([0.] * 5 + [al.ab_minus_vega(*f) for f in filters[5:]])
     ext = np.array([F99(Rv=3.1).extinguish(wave * u.AA, Ebv=e) for e in EBV])
@@ -278,6 +288,16 @@ def native_response_sensitivity(og590: bool = False) -> None:
     response_path = DATA / "standard_star_sed_response.parquet"
     out = (pd.read_parquet(response_path) if response_path.exists() else table[["star"]].copy()) if og590 else table
     ebv = table.loc[ok, "ebv"].to_numpy()
+
+    def shift(**grid: bool) -> np.ndarray:
+        _, alternate = dense_grid(base_params, model_grid(**grid)[1])
+        values = np.zeros((len(indices), 3))
+        for start in range(0, len(indices), 8192):
+            sl = slice(start, start + 8192)
+            args = ebv[sl], indices[sl, None]
+            values[sl] = (_at_ebv(alternate, *args) - _at_ebv(primary, *args))[:, 0, 5:8]
+        return values
+
     if og590:
         _, alternate, _ = model_grid(og590=True)
         _, alternate = dense_grid(base_params, alternate)
@@ -290,16 +310,11 @@ def native_response_sensitivity(og590: bool = False) -> None:
         native = table.loc[ok, "r"].to_numpy() - result["delta"][:, 1] + correction
         out.loc[ok, "r_native_og590_shift"] = native - table.loc[ok, "r_native"].to_numpy()
         out.loc[ok, "r_native_og590_err"] = np.hypot(table.loc[ok, "r_err"], result["delta_err"][:, 1])
+        out.loc[ok, "bj_native_factor_shift"] = shift(bj_factor=True)[:, 0]
     else:
-        _, alternate, _ = model_grid(energy=True)
-        _, alternate = dense_grid(base_params, alternate)
-        shift = np.zeros((len(indices), 3))
-        for start in range(0, len(indices), 8192):
-            sl = slice(start, start + 8192)
-            args = ebv[sl], indices[sl, None]
-            shift[sl] = (_at_ebv(alternate, *args) - _at_ebv(primary, *args))[:, 0, 5:8]
+        values = shift(energy=True)
         for j, band in enumerate(("bj", "r", "e")):
-            out.loc[ok, f"{band}_native_energy_shift"] = shift[:, j]
+            out.loc[ok, f"{band}_native_energy_shift"] = values[:, j]
     if og590:
         temporary = response_path.with_suffix(".parquet.tmp")
         out.to_parquet(temporary, index=False)

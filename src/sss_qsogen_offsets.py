@@ -51,8 +51,10 @@ def _native_sed_row(args):
 
 
 def _native_control_bands():
-    bands = {b: read_bandpass(f) for b, f in dict(bj="serc-j.txt", r="iiiaf_og590.txt",
-             e="possi-e.txt", tp="techpan_og590.txt", g="SLOAN_SDSS.g.dat", r_sdss="SLOAN_SDSS.r.dat").items()}
+    from stellar_sed_calibration import bj_response
+
+    bands = dict(bj=bj_response(), **{b: read_bandpass(f) for b, f in dict(r="iiiaf_og590.txt",
+                 e="possi-e.txt", tp="techpan_og590.txt", g="SLOAN_SDSS.g.dat", r_sdss="SLOAN_SDSS.r.dat").items()})
     vega = {b: ab_minus_vega(*bands[b]) for b in ("bj", "r", "e", "tp")}
     return bands, vega
 
