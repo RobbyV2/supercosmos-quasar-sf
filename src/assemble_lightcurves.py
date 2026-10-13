@@ -1,4 +1,5 @@
 from pathlib import Path
+import tarfile
 
 import h5py
 import numpy as np
@@ -55,6 +56,21 @@ def ab_minus_vega(wf, tf):
 filters = {"u": 0, "g": 1, "r": 2, "i": 3, "z": 4, "y": 5}
 bands_sdss = ["u", "g", "r", "i", "z"]
 
+
+def sdss_epochs() -> tuple[pd.Index, pd.DataFrame]:
+   with tarfile.open(_ROOT / "data/S82/macleod2012_s82_lightcurves.tar.gz") as t:
+       files = [(m.name.rsplit("/", 1)[1], t.extractfile(m).read()) for m in t if m.isfile()]
+   a = np.array(b"".join(f for _, f in files).split(), dtype=float).reshape(-1, 17)
+   dbid = np.repeat([n for n, _ in files], [f.count(b"\n") for _, f in files])
+   _, first = np.unique(dbid, return_index=True)
+   ids = match_groups_to_catalog(pd.DataFrame({"GROUP_ID": dbid[first], "RA": a[first, 15] % 360, "DEC": a[first, 16]}),
+                                 _ROOT / "data/S82/Catalog.parquet").set_index("GROUP_ID").OBJID
+   lc = pd.concat([pd.DataFrame({"objectId": ids.reindex(dbid).to_numpy(), "band": b, "time": a[:, 3 * k],
+                                 "mag": a[:, 3 * k + 1], "magerr": a[:, 3 * k + 2]}) for k, b in enumerate(bands_sdss)])
+   ok = lc.objectId.notna() & (lc.mag > 0) & (lc.mag < 90) & (lc.magerr < 99) & (lc.time > 1)
+   return pd.Index(ids), lc[ok].reset_index(drop=True)
+
+
 def concat_light_curves_df(
    filter_object_ids=None,
    skip=None,
@@ -63,13 +79,10 @@ def concat_light_curves_df(
    data_dir = _ROOT / "data/S82"
    cat = pd.read_parquet(data_dir / "Catalog.parquet").set_index("idx")
 
-   sdss = pd.read_parquet(data_dir / "dr16s82_sdssLCRaw.parquet")
    ps1 = pd.read_parquet(data_dir / "dr16s82_ps1LCRaw.parquet")
    ztf = pd.read_parquet(data_dir / "dr16s82_ZuberLCRaw.parquet")
 
-   sdss = sdss.loc[sdss["mjd"].notna()]
-
-   sdss_objids = pd.Index(sdss["objectId"].unique())
+   sdss_objids = pd.Index(pd.read_parquet(data_dir / "dr16s82_sdssLCRaw.parquet", columns=["objectId"])["objectId"].unique())
    if filter_object_ids is not None:
        sdss_objids = sdss_objids.intersection(pd.Index(filter_object_ids))
 
@@ -101,13 +114,8 @@ def concat_light_curves_df(
 
    band_map = pd.DataFrame({"band": bands_sdss, "filterID": [filters[b] for b in bands_sdss]})
 
-   sdss_df = (
-       sdss.loc[sdss["objectId"].isin(cat_keys["objectId"])]
-       .merge(band_map, on="filterID", how="inner")
-       .loc[:, ["objectId", "band", "mjd", "psMag", "psMagErr_p3"]]
-       .rename(columns={"mjd": "time", "psMag": "mag", "psMagErr_p3": "magerr"})
-   )
-   sdss_df["survey"] = "sdss"
+   _, sdss_df = sdss_epochs()
+   sdss_df = sdss_df.loc[sdss_df["objectId"].isin(cat_keys["objectId"])].assign(survey="sdss")
 
    ps1_df = (
        ps1.merge(cat_keys.loc[:, ["ps1objID", "objectId"]], on="ps1objID", how="inner")
@@ -391,8 +399,8 @@ CCD_MIN_FRAC = 0.2
 CCD_VALID_MAX = 22.4
 
 
-def ccd_reference_mags(df_base: pd.DataFrame) -> pd.Series:
-   # qsogen catalog mags: deep, no epoch detection selection; SDSS median fills gaps
+def ccd_reference_mags() -> pd.Series:
+   # qsogen catalog mags: deep, no epoch detection selection; raw SDSS median fills gaps
    cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet",
                          columns=["objectId"] + [f"sdss_{b}_qg" for b in CCD_BANDS])
    cat["OBJID"] = cat["objectId"].astype(str)
@@ -400,15 +408,17 @@ def ccd_reference_mags(df_base: pd.DataFrame) -> pd.Series:
    qg.columns = CCD_BANDS
    qg = qg.stack().rename("ref")
    qg.index = qg.index.set_names(["OBJID", "band"])
-   sd = (df_base[df_base["survey"] == "sdss"].groupby(["OBJID", "band"])["mag"].median()
-         .rename("ref"))
+   raw = pd.read_parquet(_ROOT / "data/S82/dr16s82_sdssLCRaw.parquet", columns=["objectId", "filterID", "psMag"])
+   raw = raw[raw["objectId"].isin(cat["objectId"]) & raw["filterID"].isin([filters[b] for b in bands_sdss])]
+   sd = (raw["psMag"].astype(float).groupby([raw["objectId"].astype(str).rename("OBJID"),
+                                             raw["filterID"].map({filters[b]: b for b in bands_sdss}).rename("band")])
+         .median().rename("ref"))
    z0 = float(np.nanmedian((sd - qg).dropna()[qg.reindex(sd.index) < CCD_BRIGHT]))
    return (qg + z0).combine_first(sd)
 
 
-def build_ccd_truncation(df_base: pd.DataFrame, ref: pd.Series | None = None,
+def build_ccd_truncation(df_base: pd.DataFrame, ref: pd.Series,
                         out_csv: Path | None = CCD_TRUNC_CSV) -> pd.DataFrame:
-   ref = ccd_reference_mags(df_base) if ref is None else ref
    med = df_base.groupby(["OBJID", "band", "survey"])["mag"].median().rename("med")
    n = df_base.groupby(["OBJID", "band", "survey"]).size().rename("n")
    d = pd.concat([med, n], axis=1).reset_index()
@@ -471,18 +481,19 @@ def ccd_truncation_curve() -> pd.DataFrame:
 
 
 def apply_ccd_truncation(df_base: pd.DataFrame, curve: pd.DataFrame,
-                        ref: pd.Series | None = None) -> pd.DataFrame:
+                        ref: pd.Series) -> pd.DataFrame:
    df = df_base.copy()
-   ref = ccd_reference_mags(df) if ref is None else ref
    r = ref.reindex(pd.MultiIndex.from_arrays([df["OBJID"].astype(str), df["band"]])).to_numpy()
    off, v, fr = np.zeros(len(df)), np.ones(len(df)), np.ones(len(df))
    ok = np.isfinite(r)
    has = np.zeros(len(df), dtype=bool)
    sv, bd = df["survey"].to_numpy(), df["band"].to_numpy()
    for (s, b), g in curve.groupby(["survey", "band"], sort=True):
-       m = ok & (sv == s) & (bd == b)
+       m = (sv == s) & (bd == b)
        if not m.any():
            continue
+       if not ok[m].all():
+           raise ValueError(f"{s} {b} epoch without a CCD reference magnitude")
        has[m] = True
        # flat outside measured reference range
        off[m] = np.interp(r[m], g["ref_mag"], g["offset_mag"])
@@ -552,8 +563,9 @@ def main() -> None:
    if df_base["OBJID"].isna().any():
        raise ValueError("NaN OBJID rows after concat")
    df_base["OBJID"] = df_base["OBJID"].astype(str)
+   ref = ccd_reference_mags()
    # CCD surveys detection limited (ZTF first): same treatment as plates before medians
-   df_base = apply_ccd_truncation(df_base, build_ccd_truncation(df_base))
+   df_base = apply_ccd_truncation(df_base, build_ccd_truncation(df_base, ref), ref)
 
    df_sss = native_longform()
 

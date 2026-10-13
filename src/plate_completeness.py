@@ -12,7 +12,7 @@ from scipy.spatial import cKDTree
 
 from assemble_lightcurves import (
     _pava_decreasing, ccd_reference_mags, ccd_truncation_curve, field_coords,
-    plate_centres, sss_raw, assign_group_ids_by_sky, match_groups_to_catalog, redshifts,
+    plate_centres, sss_raw, assign_group_ids_by_sky, match_groups_to_catalog, redshifts, sdss_epochs,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +56,8 @@ def catalog():
 
 def inputs():
     cat, prop = catalog()
+    macleod, _ = sdss_epochs()
+    cat = cat.assign(macleod=cat.OBJID.isin(macleod))
     lc = pd.read_parquet(DATA / "S82/total_lightcurves.parquet",
                          filters=[("band", "in", ["g", "r"])])
     lc["OBJID"] = lc.OBJID.astype(str)
@@ -149,9 +151,11 @@ def binned_curve(mag, value, keep, width=0.25, min_n=20, start=18.5, level=0.9, 
                          float(value[k].std(ddof=1)/np.sqrt(k.sum()))))
     a = np.array(rows)
     fit = _pava_decreasing(np.clip(a[:, 2], 0, 1), a[:, 1]) if monotone else np.clip(a[:, 2], 0, 1)
-    j = np.flatnonzero((a[:, 0] > start) & (fit < level))[0]
-    limit = np.interp(level, fit[j-1:j+1][::-1], a[j-1:j+1, 0][::-1])
-    return a, fit, limit
+    below = np.flatnonzero((a[:, 0] > start) & (fit < level))
+    if not len(below):
+        return a, fit, np.inf
+    j = below[0]
+    return a, fit, np.interp(level, fit[j-1:j+1][::-1], a[j-1:j+1, 0][::-1])
 
 
 def band_statistics(cat, stats, ref, interior, band, k=25, window=(17.75, 18.75)):
@@ -165,7 +169,8 @@ def band_statistics(cat, stats, ref, interior, band, k=25, window=(17.75, 18.75)
         n = stats[(stats.band == band) & (stats.survey == name)].set_index("OBJID")["count"].reindex(cat.OBJID).fillna(0).to_numpy()
         bright = (mag >= window[0]) & (mag < window[1]) & (n > 0)
         neighbor = cKDTree(co[bright]).query(co, k=min(k, int(bright.sum())))[1]
-        values[name] = (n/n[bright][neighbor].mean(axis=1), np.ones(len(cat), bool))
+        ratio = n/n[bright][neighbor].mean(axis=1)
+        values[name] = (np.where(cat.macleod.to_numpy() | (name != "sdss"), ratio, np.nan), np.ones(len(cat), bool))
     return mag, inside, detected, values
 
 
@@ -237,15 +242,9 @@ def sample_tables(cat, stats, ref, opp):
 
 def correction_components(original_median):
     cat = pd.read_parquet(DATA / "S82/Catalog.parquet", columns=["objectId"]).assign(OBJID=lambda d: d.objectId.astype(str))
-    raw = pd.read_parquet(DATA / "S82/dr16s82_sdssLCRaw.parquet",
-                          columns=["objectId", "mjd", "filterID", "psMag", "psMagErr_p3"])
-    raw = raw[raw.objectId.isin(cat.objectId) & raw[["mjd", "psMag", "psMagErr_p3"]].notna().all(axis=1)].copy()
-    raw["OBJID"] = raw.objectId.astype(str)
-    raw["band"] = raw.filterID.map(dict(enumerate("ugriz")))
-    raw = raw.rename(columns={"psMag": "mag"})
-    raw["mag"] = raw.mag.astype(float)
-    raw["survey"] = "sdss"
-    reference = ccd_reference_mags(raw)
+    _, raw = sdss_epochs()
+    raw = raw[raw.objectId.isin(cat.objectId)].assign(OBJID=lambda d: d.objectId.astype(str), survey="sdss")
+    reference = ccd_reference_mags()
     rows = []
     for (sv, band), g in ccd_truncation_curve().groupby(["survey", "band"]):
         if band not in "gr":
@@ -459,7 +458,7 @@ def fixed_members(a, s, band):
     fixed = np.stack([(a[..., 0] > 0).all(axis=1) & s[n].fillna(False).to_numpy(bool) for n in DIAGNOSIS], axis=1)
     use = fixed.any(axis=1)
     ids = s.index.to_numpy(str)[use]
-    nt = esf.clean_nightly(load_completeness_lightcurves(ids))[0].query("band == @band")
+    nt = esf.clean_nightly(load_completeness_lightcurves(ids)).query("band == @band")
     return use, fixed[use], ids, nt, DIAGNOSIS.index(ADOPTED_SELECTION[band])
 
 

@@ -5,6 +5,7 @@ supply    data/S82/{Catalog,dr16s82_sdssLCRaw,dr16s82_ps1LCRaw,dr16s82_ZuberLCRa
 hosted    data/roe_stars.hdf5 (780.0 MB), host TBD
 fetch     curl -L http://quasar.astro.illinois.edu/paper_data/DR16Q/dr16q_prop_May01_2024.fits.gz | gunzip > data/dr16q_prop_May01_2024.fits
 fetch     curl -Lo data/stripe82calibStars_v4.2.dat https://faculty.washington.edu/ivezic/sdss/calib82/dataV2/stripe82calibStars_v4.2.dat
+fetch     curl --create-dirs -Lo data/S82/macleod2012_s82_lightcurves.tar.gz https://faculty.washington.edu/ivezic/macleod/qso_dr7/QSO_S82.tar.gz
 fetch     for p in ngp sgp; do curl -L --create-dirs -o data/sfd/SFD_dust_4096_$p.fits https://raw.githubusercontent.com/kbarbary/sfddata/7a5fe7fadf086561ba4748756e59a4c51d0ec632/SFD_dust_4096_$p.fits; done
 fetch     curl -Lo data/stone2022_ensemble_sf_psd.fits.gz https://zenodo.org/records/7624056/files/EnsDat.fits.gz
 fetch     curl -Lo data/stone2022_lightcurves.fits.gz https://zenodo.org/records/7624056/files/TotalDat.fits.gz
@@ -28,7 +29,7 @@ $py src/sf_model_checks.py; for m in --noise-fraction --fit-range --plate-replac
 $py src/plate_magnitude_models.py --native-floor-impact --native-variant effective  # residual-variance impact
 $py src/fit_structure_function.py --literature-choices  # literature comparison
 $py src/fit_structure_function.py --refit-object-first  # group SFs, rises
-for m in --group-trends --rejection; do $py src/sf_model_checks.py $m; done  # group trends, rejection
+$py src/sf_model_checks.py --group-trends  # group trends
 $py src/simulate_structure_function.py --aggregation-test; $py src/simulate_structure_function.py --excess-null  # DRW recovery, excess null
 for m in --native-sed-control --observed-sed-control; do $py src/sss_qsogen_offsets.py $m; done  # quasar SED controls
 $py src/plate_magnitude_models.py --native-sed-impact --native-variant effective  # SED sensitivity

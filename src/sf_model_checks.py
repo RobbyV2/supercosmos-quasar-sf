@@ -297,7 +297,7 @@ def noise_fraction():
             ids,fid=f[f'fiducial_ids_{b}'],f[f'fiducial_acc_{b}']
             nb=fid.shape[1]
             pairs=f[f'fiducial_asymmetry_acc_{b}'][:,:2,0,:nb,0].sum(0)
-            nt=esf.clean_nightly(load_completeness_lightcurves(ids))[0].query('band == @b')
+            nt=esf.clean_nightly(load_completeness_lightcurves(ids)).query('band == @b')
             a=esf.accumulate(nt,ids,zmap,bands=[b],resid=True)[:,0,:nb]
             n=a[...,0]
             dm2,noise,cal=((x/n).mean(0) for x in (a[...,1],a[...,2]-a[...,4],a[...,4]))
@@ -322,7 +322,7 @@ def star_floor(lo, hi, n_boot=2000, seed=930):
     lc = star_lcs(lo, hi)
     rng, out = np.random.default_rng(seed), {}
     for sv, s in lc.groupby('survey'):
-        nt = esf.reject_outliers(esf.condense_nightly(s))[0]
+        nt = esf.condense_nightly(s)
         ids = np.sort(nt.OBJID.unique())
         acc = esf.accumulate(nt, ids, pd.Series(0., index=ids)).sum(axis=2)
         for bi, b in enumerate(esf.BANDS):
@@ -347,7 +347,7 @@ def fit_range():
     for b in esf.BANDS:
         a, r, prop = fid[b]
         nb, ids = a.shape[1], prop.index.to_numpy(str)
-        nt = esf.clean_nightly(load_completeness_lightcurves(ids))[0].query('band == @b')
+        nt = esf.clean_nightly(load_completeness_lightcurves(ids)).query('band == @b')
         coef = []
         for s in ccd:
             acc = esf.accumulate(nt.assign(mag=0., sig=nt.survey.eq(s).astype(float)), ids, prop.z, bands=[b])[:, 0, :nb]
@@ -372,101 +372,10 @@ def fit_range():
         OUT/'structure_function_fit_range_floor.csv', index=False)
 
 
-REJECT_SIGMA = (3., 4., 5., 7., 10., np.inf)
-
-
-def deviations(nightly):
-    n = esf.segment_deviations(nightly).sort_values([*esf.SEGMENT, 'night'], ignore_index=True)
-    return n.assign(rob=np.maximum(n.mad, n.err), noisy=n.err >= n.mad,
-                    nseg=n.groupby(esf.SEGMENT, observed=True, sort=False).mag.transform('size'))
-
-
-def night_rows(n, sample):
-    rows = []
-    for (b, s), d in [*n.groupby(['band', 'survey']), *(((b, 'all'), d) for b, d in n.groupby('band'))]:
-        d = d.sort_values([*esf.SEGMENT, 'night'])
-        res, rob = d.res.to_numpy(), d.rob.to_numpy()
-        key = (d.night+1e7*d.groupby(esf.SEGMENT).ngroup()).to_numpy(float)
-        night = d.night.to_numpy()
-        seg = d.drop_duplicates(esf.SEGMENT)
-        base = dict(sample=sample, band=b, survey=s, n_objects=d.OBJID.nunique(), n_nights=len(d),
-                    segment_nights_median=seg.nseg.median(), nights_in_3plus_fraction=(d.nseg >= 3).mean(),
-                    noise_dominated_segment_fraction=seg.noisy.mean(), max_abs_dev_sigma=np.abs(res/rob).max())
-        for t in REJECT_SIGMA:
-            far = np.abs(res) > t*rob
-            r, c = np.flatnonzero(far), np.concatenate([[0], np.cumsum(far)])
-            lo, hi = np.searchsorted(key, key[r]-30, 'left'), np.searchsorted(key, key[r]+30, 'right')
-            near, bad, x = hi-lo-1, c[hi]-c[lo]-1, pd.Series(np.abs(res[r]))
-            g = pd.Series(far).groupby(night)
-            k, m, w = g.transform('sum').to_numpy(), g.transform('size').to_numpy(), g.sum().idxmax()
-            on = (night == w) & (len(r) > 0)
-            rows.append(dict(base, threshold_sigma=t, n_rejected=len(r), rejected_fraction=len(r)/len(d),
-                             n_objects_affected=d.OBJID.iloc[r].nunique(), rejected_abs_dev_mag_median=x.median(),
-                             rejected_abs_dev_mag_q90=x.quantile(.9), rejected_abs_dev_mag_max=x.max(),
-                             rejected_abs_dev_sigma_median=(x/rob[r]).median(), rejected_fainter_fraction=pd.Series(res[r] > 0).mean(),
-                             n_isolated=int(((near > 0) & (bad == 0)).sum()), n_clustered=int((bad > 0).sum()),
-                             n_no_neighbour=int((near == 0).sum()),
-                             rejected_coincident_fraction=pd.Series(((m >= 5) & (k-1 >= .2*(m-1)))[r]).mean(),
-                             worst_night=w if len(r) else np.nan, worst_night_rejected=far[on].sum(),
-                             worst_night_objects=on.sum(), worst_night_median_res_mag=pd.Series(res[on]).median()))
-    return rows
-
-
-def rejection():
-    from plate_completeness import load_completeness_lightcurves
-    member = pd.read_parquet(OUT/'structure_function_sampling_membership.parquet').query('fiducial')
-    ids = {b: np.sort(member[member.band.eq(b)].OBJID.to_numpy(str)) for b in esf.BANDS}
-    with np.load(OUT/'ensemble_sf_covariance.npz') as f:
-        reps = {b: f[f'replicates_{b}'] for b in esf.BANDS}
-        for b in esf.BANDS:
-            np.testing.assert_array_equal(f[f'objids_{b}'].astype(str), ids[b])
-    cat = pd.read_parquet(OUT/'plate_completeness_sample.parquet').astype({'OBJID': str})
-    prop, ref = cat.drop_duplicates('OBJID').set_index('OBJID'), cat.set_index(['band', 'OBJID']).reference_mag
-    nightly = esf.condense_nightly(load_completeness_lightcurves(np.union1d(*ids.values())))
-    q = deviations(nightly)
-    order = lambda x: x[list(nightly.columns)].sort_values([*esf.SEGMENT, 'night'], ignore_index=True)
-    pd.testing.assert_frame_equal(order(esf.reject_outliers(nightly)[0]), order(q[np.abs(q.res) <= esf.CLIP_SIGMA*q.rob]))
-    q = pd.concat([q[q.band.eq(b) & q.OBJID.isin(ids[b])] for b in esf.BANDS])
-    mags = {b: ref[b].reindex(ids[b]) for b in esf.BANDS}
-    lo, hi = ({b: f(m) for b, m in mags.items()} for f in (np.min, np.max))
-    stars = pd.concat([deviations(esf.condense_nightly(s)) for _, s in star_lcs(lo, hi).groupby('survey')])
-    pd.DataFrame(night_rows(q, 'quasar')+night_rows(stars, 'star')).to_csv(OUT/'structure_function_rejection_nights.csv', index=False)
-    k0, rows = int(np.argmin(abs(esf.CENTERS-2371))), []
-    cols = ['variant', 'threshold_sigma', 'n_restored', 'band', 'bin', 'lag_center_days', 'n_objects', 'n_pairs', 'sf_mag',
-            'sf_lo_mag', 'sf_hi_mag', 'sf_err_mag', 'rise_mag', 'rise_lo_mag', 'rise_hi_mag', 'rise_bootstrap_sigma']
-    keep = lambda d, t: d[np.abs(d.res) <= t*d.rob]
-    for b in esf.BANDS:
-        d, nb = q[q.band.eq(b)], reps[b].shape[1]
-        z, lum = (prop[c].reindex(ids[b]).to_numpy(float) for c in ('z', 'loglbol'))
-        def sf(x, variant, t=esf.CLIP_SIGMA, n=np.nan):
-            s, r = fsf._object_summary(esf.accumulate(x, ids[b], prop.z, bands=[b], resid=True)[:, 0, :nb], z, lum, *fsf.bootstrap_plan(b, 'fiducial'))
-            dr = r-r[:, [k0]]
-            rows.append(s.assign(variant=variant, threshold_sigma=t, n_restored=n, band=b, bin=np.arange(nb),
-                                 rise_mag=s.sf_mag-s.sf_mag[k0], rise_lo_mag=np.percentile(dr, 16, 0),
-                                 rise_hi_mag=np.percentile(dr, 84, 0), rise_bootstrap_sigma=dr.std(0, ddof=1))[cols])
-            return r
-        for t in REJECT_SIGMA:
-            r = sf(keep(d, t), 'threshold', t)
-            if t == esf.CLIP_SIGMA:
-                np.testing.assert_allclose(r, reps[b], rtol=1e-9, atol=1e-12)
-        out = d[np.abs(d.res) > esf.CLIP_SIGMA*d.rob].sort_values('res', key=np.abs, ascending=False)
-        for n in (1, 3, 10, 30, 100):
-            sf(pd.concat([keep(d, esf.CLIP_SIGMA), out[:n]]), 'restore_largest', n=n)
-        for v, x in out.groupby('survey'):
-            sf(pd.concat([keep(d, esf.CLIP_SIGMA), x]), f'restore_{v}', n=len(x))
-    table = pd.concat(rows, ignore_index=True)
-    adopted = table[table.variant.eq('threshold') & table.threshold_sigma.eq(esf.CLIP_SIGMA)]
-    fixed = pd.read_csv(OUT/'structure_function_fixed_population.csv').query("sample == 'fixed'")
-    rises = pd.read_csv(OUT/'structure_function_object_rises.csv').query("sample == 'fixed'")
-    np.testing.assert_allclose(adopted[cols[8:11]], fixed[cols[8:11]], rtol=1e-9)
-    np.testing.assert_allclose(adopted[adopted.bin > k0][cols[12:]], rises[cols[12:]], rtol=1e-9)
-    table.to_csv(OUT/'structure_function_rejection_sensitivity.csv', index=False)
-
-
 def fiducial_nightly():
     from plate_completeness import load_completeness_lightcurves
     selected = [x for x in samples() if x[1] == 'fiducial']
-    nightly = esf.clean_nightly(load_completeness_lightcurves(np.unique(np.concatenate([x[3].index for x in selected]))))[0]
+    nightly = esf.clean_nightly(load_completeness_lightcurves(np.unique(np.concatenate([x[3].index for x in selected]))))
     for band, _, base, p, _ in selected:
         n = nightly[nightly.band.eq(band) & nightly.OBJID.isin(p.index)].reset_index(drop=True)
         run = lambda x, ids=p.index.to_numpy(): esf.accumulate(x, ids, p.z, bands=[band], edges=esf.EDGES[:base.shape[1]+1], resid=True)[:, 0]
@@ -559,8 +468,6 @@ if __name__ == '__main__':
         noise_fraction()
     elif '--fit-range' in sys.argv:
         fit_range()
-    elif '--rejection' in sys.argv:
-        rejection()
     elif '--plate-replacement' in sys.argv:
         plate_replacement()
     else:

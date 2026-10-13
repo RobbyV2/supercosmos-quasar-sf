@@ -18,8 +18,6 @@ CENTERS = np.sqrt(EDGES[:-1] * EDGES[1:])
 NB = len(EDGES) - 1
 # Hartlap factor 0.998 here (0.920 at 200); own generator keeps 200-draw error bars fixed
 N_COV_BOOT = 10000
-CLIP_SIGMA = 5.0
-SEGMENT = ["OBJID", "band", "survey"]
 QVC_REJECT = False
 QVC_HALF_WINDOW = 30.0
 QVC_MIN_NEIGHBORS = 8
@@ -66,25 +64,12 @@ def condense_nightly(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["wm"] = df["w"] * df["mag"]
     g = df.groupby(["OBJID", "band", "night"], sort=False, observed=True).agg(
-        wsum=("w", "sum"), wmsum=("wm", "sum"), sss=("is_sss", "max"), survey=("survey", "first"),
+        wsum=("w", "sum"), wmsum=("wm", "sum"), time=("time", "mean"), sss=("is_sss", "max"), survey=("survey", "first"),
         plate=("plate", "max"), calib_ok=("ok", "min"), trunc_v=("vt", "min"))
     g["mag"] = g["wmsum"] / g["wsum"]
     g["sig"] = g["wsum"] ** -0.5
-    return g.reset_index()[["OBJID", "band", "night", "mag", "sig", "sss", "survey", "plate",
+    return g.reset_index()[["OBJID", "band", "night", "time", "mag", "sig", "sss", "survey", "plate",
                             "calib_ok", "trunc_v"]]
-
-
-def segment_deviations(nightly: pd.DataFrame) -> pd.DataFrame:
-    g = nightly.groupby(SEGMENT, observed=True, sort=False)
-    res = nightly["mag"] - g["mag"].transform("median")
-    mad = 1.4826 * res.abs().groupby([nightly[c] for c in SEGMENT], observed=True, sort=False).transform("median")
-    return nightly.assign(res=res, mad=mad, err=g["sig"].transform("median"))
-
-
-def reject_outliers(nightly: pd.DataFrame) -> tuple[pd.DataFrame, int, int, int]:
-    d, sss = segment_deviations(nightly), nightly["sss"].to_numpy(bool)
-    keep = (np.abs(d["res"].to_numpy()) <= CLIP_SIGMA * np.maximum(d["mad"].to_numpy(), d["err"].to_numpy())) | sss
-    return nightly.loc[keep], int((~keep).sum()), len(nightly), int((~keep & sss).sum())
 
 
 def qvc_significance(nightly: pd.DataFrame) -> np.ndarray:
@@ -114,17 +99,15 @@ def qvc_mask(nightly: pd.DataFrame, threshold: float = QVC_SIGMA) -> np.ndarray:
     return qvc_significance(nightly) > threshold
 
 
-def clean_nightly(lc: pd.DataFrame) -> tuple[pd.DataFrame, int, int, int]:
+def clean_nightly(lc: pd.DataFrame) -> pd.DataFrame:
     ids = lc["OBJID"].unique()
     parts = []
     for chunk in np.array_split(ids, max(1, len(ids) // 5000)):
         n = condense_nightly(lc[lc["OBJID"].isin(chunk)])
         if QVC_REJECT:
             n = n.loc[~qvc_mask(n)]
-        out, *rest = reject_outliers(n)
-        parts.append((pd.concat([out, floor_variance(out)], axis=1), *rest))
-    return (pd.concat([q[0] for q in parts], ignore_index=True),
-            *(sum(q[k] for q in parts) for k in (1, 2, 3)))
+        parts.append(pd.concat([n, floor_variance(n)], axis=1))
+    return pd.concat(parts, ignore_index=True)
 
 
 FLOOR_SURVEY = {("g", False): "SERC-J/EJ", ("r", False): "SERC-R/AAO-R",
@@ -188,7 +171,7 @@ def accumulate(nightly: pd.DataFrame, objids: np.ndarray, zmap: pd.Series,
         if n < 2 or b not in bi_map:
             continue
         z = zmap[o]
-        t = sub["night"].to_numpy(dtype=float)
+        t = sub["time"].to_numpy(dtype=float)
         m = sub["mag"].to_numpy()
         s2 = sub["sig"].to_numpy() ** 2
         fl = sub["sss"].to_numpy(dtype=bool)
@@ -228,7 +211,7 @@ def accumulate(nightly: pd.DataFrame, objids: np.ndarray, zmap: pd.Series,
     return acc
 
 
-KERNELS = (accumulate, clean_nightly, condense_nightly, segment_deviations, reject_outliers, floor_variance)
+KERNELS = (accumulate, clean_nightly, condense_nightly, floor_variance)
 
 
 SFMethod = Literal["object_mean", "object_median", "positive_median", "amplitude_mean", "pooled"]

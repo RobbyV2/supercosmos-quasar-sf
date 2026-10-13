@@ -162,7 +162,7 @@ def _object_lag_kernel(nightly, ids, zmap, n_bins, subdivisions=32):
     edges = np.geomspace(EDGES[0], EDGES[n_bins], n_bins*subdivisions+1)
     groups = dict(tuple(nightly.groupby('OBJID', sort=False)))
     for q, oid in enumerate(ids):
-        t = groups[oid].night.to_numpy(float)
+        t = groups[oid].time.to_numpy(float)
         ii, jj = np.triu_indices(len(t), 1)
         lag = abs(t[jj]-t[ii])/(1+zmap[oid])
         h = np.searchsorted(edges, lag, side='right')-1
@@ -307,7 +307,7 @@ def object_first_results():
     for start in range(completed,len(ids),1000):
         stop=min(start+1000,len(ids))
         part=ids[start:stop]
-        acc[start:stop]=accumulate(esf.clean_nightly(load_completeness_lightcurves(part))[0],part,zmap,resid=True)
+        acc[start:stop]=accumulate(esf.clean_nightly(load_completeness_lightcurves(part)),part,zmap,resid=True)
         np.savez_compressed(cache,acc=acc,ids=ids,signature=signature,completed=stop)
         print(f'Accumulated {stop}/{len(ids)} objects',flush=True)
     adopted=_object_completeness_sweep(acc,ids,sample,z,lum,output)
@@ -328,8 +328,8 @@ def object_first_results():
         table['sample']='fixed'
         table['band']=band
         table['selection']=adopted[band]
-        nt=esf.clean_nightly(load_completeness_lightcurves(oid).query('band == @band'))[0]
-        nights=nt.groupby('OBJID').night
+        nt=esf.clean_nightly(load_completeness_lightcurves(oid).query('band == @band'))
+        nights=nt.groupby('OBJID').time
         span,edge=(nights.max()-nights.min()).max(),EDGES[endpoint]
         redshift.append(dict(band=band,n=len(oid),z_min=z[keep].min(),z_median=np.median(z[keep]),z_max=z[keep].max(),
                              final_bin_lower_edge_days=edge,max_observed_separation_days=span,implied_z_max=span/edge-1))

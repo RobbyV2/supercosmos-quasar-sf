@@ -15,8 +15,8 @@ CACHE = esf.CACHE / "sampling"
 
 
 def pair_values(sub, redshift, edges=esf.EDGES):
-    sub = sub.sort_values("night", kind="stable")
-    t, mag, sig, vt = (sub[c].to_numpy(float) for c in ("night", "mag", "sig", "trunc_v"))
+    sub = sub.sort_values("time", kind="stable")
+    t, mag, sig, vt = (sub[c].to_numpy(float) for c in ("time", "mag", "sig", "trunc_v"))
     i, j = np.triu_indices(len(sub), 1)
     bins = np.searchsorted(edges, (t[j] - t[i]) / (1 + redshift), side="right") - 1
     good = (bins >= 0) & (bins < len(edges) - 1)
@@ -88,7 +88,7 @@ def build_cache(sample, n_draw):
             with np.load(path) as f:
                 if str(f["signature"]) == token:
                     continue
-        nt = esf.clean_nightly(load_completeness_lightcurves(part[np.isin(part, usable)]))[0]
+        nt = esf.clean_nightly(load_completeness_lightcurves(part[np.isin(part, usable)]))
         index = {o: i for i, o in enumerate(part)}
         acc = np.zeros((len(part), 2, len(KINDS), 3, esf.NB, 3))
         draws, draw_keys = [], []

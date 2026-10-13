@@ -9,8 +9,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ensemble_structure_function as esf
-from ensemble_structure_function import (BANDS, EDGES, CENTERS, NB, LC_PARQUET,
-                                         condense_nightly, reject_outliers)
+from ensemble_structure_function import BANDS, EDGES, CENTERS, NB, LC_PARQUET, condense_nightly
 from assemble_lightcurves import redshifts
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -77,7 +76,7 @@ def simulate_mags(lc: pd.DataFrame, objids: np.ndarray, z: np.ndarray, sfinf: np
 
 def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
                          long_n: int = 1 << 19, shapes: bool = True,
-                         on_clipped: Callable[..., None] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                         on_noisy: Callable[..., None] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sf_model_checks import psd_grid
     lc = pd.read_parquet(_ROOT / LC_PARQUET, filters=[("band", "in", BANDS)])
     with np.load(_ROOT / "data/ensemble_sf_covariance.npz") as f:
@@ -104,7 +103,7 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
         descriptors.append((oi[o], BANDS.index(b), sub.index.to_numpy(),
                             ii[keep].astype(np.int32), jj[keep].astype(np.int32),
                             bins[keep].astype(np.int8), days[keep]))
-    sim_lc = nightly.rename(columns={"night": "time", "sig": "magerr"})
+    sim_lc = nightly.drop(columns="time").rename(columns={"night": "time", "sig": "magerr"})
     base = pd.Series(0.0, index=pd.MultiIndex.from_frame(nightly[["OBJID", "band"]].drop_duplicates()))
     zero = np.zeros((len(objids), len(BANDS), NB, 3))
     sig = nightly.sig.to_numpy()
@@ -150,22 +149,14 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
             intrinsic = simulate_mags(sim_lc, objids, z, amp, tau, gen, base,
                                       grid_n=n, add_noise=False, alpha=alpha)
             noisy = intrinsic + gen.normal(0, sig)
-            clipped = reject_outliers(nightly.assign(mag=noisy, sim_index=np.arange(len(nightly))))[0]
-            retained = np.isin(np.arange(len(nightly)), clipped.sim_index)
-            for noise, magnitudes, variance, active in [
-                    ("noiseless", intrinsic, np.zeros_like(sig), np.ones(len(sig), bool)),
-                    ("observed_noise", noisy, sig ** 2, np.ones(len(sig), bool)),
-                    ("observed_noise_clipped", noisy, sig ** 2, retained)]:
+            for noise, magnitudes, variance in [("noiseless", intrinsic, np.zeros_like(sig)),
+                                                ("observed_noise", noisy, sig ** 2)]:
                 acc = zero.copy()
                 for o, bi, positions, ii, jj, bins, _ in descriptors:
                     pi, pj = positions[ii], positions[jj]
-                    use = active[pi] & active[pj]
-                    nb = bins[use]
-                    acc[o, bi, :, 0] = np.bincount(nb, minlength=NB)
-                    acc[o, bi, :, 1] = np.bincount(nb, weights=(magnitudes[pi[use]] - magnitudes[pj[use]]) ** 2,
-                                                  minlength=NB)
-                    acc[o, bi, :, 2] = np.bincount(nb, weights=variance[pi[use]] + variance[pj[use]],
-                                                  minlength=NB)
+                    acc[o, bi, :, 0] = np.bincount(bins, minlength=NB)
+                    acc[o, bi, :, 1] = np.bincount(bins, weights=(magnitudes[pi] - magnitudes[pj]) ** 2, minlength=NB)
+                    acc[o, bi, :, 2] = np.bincount(bins, weights=variance[pi] + variance[pj], minlength=NB)
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", RuntimeWarning)
                     sf2 = esf.ensemble_second_moment(acc)
@@ -174,7 +165,7 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
                         case_draws.append(dict(regime=regime, psd=psd, grid_days=n, noise=noise, band=b,
                                                realization=realization, bin=k, sf2_mag2=sf2[bi, k],
                                                sf_mag=np.sqrt(max(sf2[bi, k], 0.0))))
-                if noise == "observed_noise_clipped":
+                if noise == "observed_noise":
                     for bi, b in enumerate(BANDS):
                         keep = np.isin(objids, selected[b])
                         bounds, _ = esf.object_bootstrap(acc[keep, bi, :nbands[b]], n_boot=512,
@@ -183,8 +174,8 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
                         for k in range(nbands[b]):
                             coverage.append(dict(band=b, bin=k, covered=bounds[0, k] <= target[k] <= bounds[2, k],
                                                  width_mag2=bounds[2, k] - bounds[0, k]))
-                    if on_clipped:
-                        on_clipped(regime, realization, acc, objids)
+                    if on_noisy:
+                        on_noisy(regime, realization, acc, objids)
             if realization == 0 or (realization + 1) % 8 == 0:
                 print(f"aggregation {regime} {psd} grid {n} {realization + 1}/{n_real}, "
                       f"elapsed {time.monotonic() - started:.1f} s", flush=True)
@@ -199,7 +190,7 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
             value, squared = group.sf_mag.to_numpy(), group.sf2_mag2.to_numpy()
             target, gtarget = target_sf[bi, k], grid_sf[bi, k]
             c = cov[(cov.band == b) & (cov.bin == k)]
-            adopted = noise == "observed_noise_clipped"
+            adopted = noise == "observed_noise"
             rows.append(dict(regime=regime, psd=psd, grid_days=n, noise=noise, band=b, sample="fiducial",
                              lag_center_days=CENTERS[k], n_objects=len(selected[b]), n_real=n_real,
                              n_pairs=int(truth[:, bi, k, 0].sum()), sf_mag=value.mean(),
@@ -223,7 +214,7 @@ def drw_excess_null(n_real: int = 64) -> pd.DataFrame:
     rows = []
     started = time.monotonic()
 
-    def on_clipped(regime, realization, acc, objids):
+    def on_noisy(regime, realization, acc, objids):
         new = []
         for bi, b in enumerate(BANDS):
             ids, nb = fiducial[b]
@@ -236,7 +227,7 @@ def drw_excess_null(n_real: int = 64) -> pd.DataFrame:
               + " ".join(f"{r['band']} {r['drw_long_sigma_param_scaled']:.2f}" for r in new)
               + f", elapsed {time.monotonic() - started:.0f} s", flush=True)
 
-    aggregation_recovery(n_real, shapes=False, on_clipped=on_clipped)
+    aggregation_recovery(n_real, shapes=False, on_noisy=on_noisy)
     d = pd.DataFrame(rows)
     by = d.groupby(["regime", "band"], sort=False)[cols]
     hit = d[cols].ge(measured.loc[d.band].to_numpy())

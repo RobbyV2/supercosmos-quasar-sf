@@ -598,7 +598,7 @@ def native_floor_impact():
     import sf_model_checks as checks
     samples=list(checks.samples())
     all_ids=np.unique(np.concatenate([p.index.to_numpy(str) for _,_,_,p,_ in samples]))
-    nightly=esf.clean_nightly(pc.load_completeness_lightcurves(all_ids))[0]
+    nightly=esf.clean_nightly(pc.load_completeness_lightcurves(all_ids))
     redshift=pd.concat([p.z for _,_,_,p,_ in samples]).groupby(level=0).first()
     table=pd.read_csv(ROOT/"data/plate_native_pair_variance.csv")
     draws=np.load(ROOT/"data/plate_native_pair_variance_bootstrap.npz")["draws"]
@@ -609,8 +609,8 @@ def native_floor_impact():
     objects={};rng=np.random.default_rng(42115)
     for (obj,band),g in nightly.groupby(["OBJID","band"],observed=True,sort=False):
         if band not in "gr":continue
-        g=g.sort_values("night",kind="stable")
-        t,mag,sig,vt=(g[c].to_numpy(float) for c in ("night","mag","sig","trunc_v"))
+        g=g.sort_values("time",kind="stable")
+        t,mag,sig,vt=(g[c].to_numpy(float) for c in ("time","mag","sig","trunc_v"))
         i,j=np.triu_indices(len(g),1);observed=t[j]-t[i]
         bins=np.searchsorted(esf.EDGES,observed/(1+redshift[obj]),side="right")-1
         use=(bins>=0)&(bins<esf.NB);i,j,bins,observed=i[use],j[use],bins[use],observed[use]
@@ -666,7 +666,7 @@ def native_sed_impact():
     import sf_model_checks as checks
     selected=[q for q in checks.samples() if q[1]=="fiducial"]
     ids=np.unique(np.concatenate([p.index.to_numpy(str) for _,_,_,p,_ in selected]))
-    nightly=esf.clean_nightly(pc.load_completeness_lightcurves(ids))[0]
+    nightly=esf.clean_nightly(pc.load_completeness_lightcurves(ids))
     epochs=pd.read_parquet(ROOT/"data/plate_native_quasar_epochs.parquet")
     epochs["OBJID"]=epochs.OBJID.astype(str)
     epochs=epochs.set_index(["OBJID","band","PLATEID"])
