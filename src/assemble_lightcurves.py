@@ -404,6 +404,7 @@ CCD_MIN_FRAC = 0.2
 # held-out test unbiased to here; beyond, g over-corrects (+0.072 mag at 22.6, +0.120 at 23.1)
 CCD_VALID_MAX = 22.4
 ZTF_META = _ROOT / "data/ztf/ztf_current_meta_sci.csv.gz"
+ZTF_FAINT = 20.0
 PALOMAR = EarthLocation.from_geodetic(-116.863 * u.deg, 33.356 * u.deg, 1706 * u.m)
 
 
@@ -427,16 +428,19 @@ def ztf_maglimit(z: pd.DataFrame) -> np.ndarray:
 
 
 def shallow_epochs(obj: np.ndarray, band: np.ndarray, survey: np.ndarray, mag: np.ndarray, maglimit: np.ndarray) -> np.ndarray:
-   # ZTF limit brighter than the source's median raw ZTF mag (ZTF cautionary note 8; Arevalo+2023); unmatched kept
+   # limit brighter than median raw ZTF mag (ZTF note 8; unmatched kept), or median > ZTF_FAINT (Arevalo+2023)
    z = survey == "ztf"
    ref = pd.Series(np.where(z, mag, np.nan)).groupby([obj, band]).transform("median").to_numpy()
    matched = z & np.isfinite(maglimit)
-   drop = matched & (maglimit < ref)
+   shallow = matched & (maglimit < ref)
+   faint = z & (ref > ZTF_FAINT)
+   drop = shallow | faint
    for b in sorted(set(band[z])):
        k = z & (band == b)
        print(f"ztf depth {b}: {int((matched & k).sum())} of {int(k.sum())} epochs matched "
-             f"({(matched & k).sum() / k.sum():.4f}), {int((drop & k).sum())} shallower than reference dropped, "
-             f"{int((k & ~matched).sum())} unmatched kept")
+             f"({(matched & k).sum() / k.sum():.4f}), {int((shallow & k).sum())} shallower than reference, "
+             f"{int((faint & k).sum())} from {len(set(obj[faint & k]))} sources fainter than {ZTF_FAINT}, "
+             f"{int((drop & k).sum())} dropped, {int((k & ~matched).sum())} unmatched kept")
    return drop
 
 
