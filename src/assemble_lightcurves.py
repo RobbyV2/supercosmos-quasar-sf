@@ -7,7 +7,8 @@ import pandas as pd
 
 from astropy.io import fits
 from astropy.table import Table
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import EarthLocation, SkyCoord
+from astropy.time import Time
 from scipy.optimize import curve_fit
 from scipy.stats import norm
 import astropy.units as u
@@ -128,10 +129,14 @@ def concat_light_curves_df(
    ztf_df = (
        ztf.merge(cat_keys.loc[:, ["ps1objID", "objectId"]], on="ps1objID", how="inner")
        .merge(band_map, on="filterID", how="inner")
-       .loc[:, ["objectId", "band", "mjd", "mag", "magerr_p3"]]
-       .rename(columns={"mjd": "time", "magerr_p3": "magerr"})
    )
+   ztf_df = (ztf_df.assign(maglimit=ztf_maglimit(ztf_df))
+             .loc[:, ["objectId", "band", "mjd", "mag", "magerr_p3", "maglimit"]]
+             .rename(columns={"mjd": "time", "magerr_p3": "magerr"}))
    ztf_df["survey"] = "ztf"
+   ztf_df["shallow"] = shallow_epochs(ztf_df["objectId"].to_numpy(), ztf_df["band"].to_numpy(), ztf_df["survey"].to_numpy(),
+                                      ztf_df["mag"].to_numpy(), ztf_df["maglimit"].to_numpy())
+   ztf_df = ztf_df.drop(columns="maglimit")
 
    ps1_df = ps1_df.merge(offset_long, on=["objectId", "band"], how="left")
    ztf_df = ztf_df.merge(offset_long, on=["objectId", "band"], how="left")
@@ -286,6 +291,7 @@ def assemble_total_lightcurve(df_base: pd.DataFrame, df_sss: pd.DataFrame) -> pd
        df["plate"] = -1
    df["plate"] = pd.to_numeric(df["plate"], errors="coerce").fillna(-1).astype(np.int64)
    df["calib_ok"] = df["calib_ok"].fillna(True).astype(bool)
+   df["shallow"] = df["shallow"].eq(True)
    df["trunc_v"] = (pd.to_numeric(df["trunc_v"], errors="coerce").fillna(1.0).astype(float)
                     if "trunc_v" in df.columns else 1.0)
    df = df.drop_duplicates(subset=["OBJID", "band", "time", "mag", "survey"])
@@ -397,6 +403,41 @@ CCD_BANDS = ["g", "r", "i", "z"]
 CCD_MIN_FRAC = 0.2
 # held-out test unbiased to here; beyond, g over-corrects (+0.072 mag at 22.6, +0.120 at 23.1)
 CCD_VALID_MAX = 22.4
+ZTF_META = _ROOT / "data/ztf/ztf_current_meta_sci.csv.gz"
+PALOMAR = EarthLocation.from_geodetic(-116.863 * u.deg, 33.356 * u.deg, 1706 * u.m)
+
+
+def ztf_maglimit(z: pd.DataFrame) -> np.ndarray:
+   # Zubercal mjd heliocentric mid-exposure; obsjd UTC start of the 30 s exposure; NaN unmatched
+   m = pd.read_csv(ZTF_META)
+   m = pd.DataFrame({"fieldid": m.field, "rcidin": (m.ccdid - 1) * 4 + m.qid - 1, "band": m.filtercode.str[1],
+                     "t0": m.obsjd - 2400000.5, "maglimit": m.maglimit})
+   if m.duplicated(["fieldid", "rcidin", "band", "t0"]).any():
+       raise ValueError("duplicate ZTF exposure metadata")
+   node = pd.DataFrame({"t": np.round(z["mjd"].to_numpy() * 8) / 8, "ra": np.round(z["objra"].to_numpy() * 2) / 2})
+   nodes = node.drop_duplicates()
+   nodes["ltt"] = Time(nodes.t.to_numpy(), format="mjd", scale="utc", location=PALOMAR).light_travel_time(
+       SkyCoord(nodes.ra.to_numpy(), 0.0, unit="deg"), kind="heliocentric").to_value("day")
+   q = pd.DataFrame({"fieldid": z["fieldid"].to_numpy(np.int64), "rcidin": z["rcidin"].to_numpy(np.int64),
+                     "band": z["band"].to_numpy(str), "i": np.arange(len(z)),
+                     "t": z["mjd"].to_numpy() - node.merge(nodes, how="left").ltt.to_numpy() - 15 / 86400})
+   j = pd.merge_asof(q.sort_values("t"), m.sort_values("t0"), left_on="t", right_on="t0",
+                     by=["fieldid", "rcidin", "band"], direction="nearest", tolerance=120 / 86400)
+   return j.sort_values("i").maglimit.to_numpy()
+
+
+def shallow_epochs(obj: np.ndarray, band: np.ndarray, survey: np.ndarray, mag: np.ndarray, maglimit: np.ndarray) -> np.ndarray:
+   # ZTF limit brighter than the source's median raw ZTF mag (ZTF cautionary note 8; Arevalo+2023); unmatched kept
+   z = survey == "ztf"
+   ref = pd.Series(np.where(z, mag, np.nan)).groupby([obj, band]).transform("median").to_numpy()
+   matched = z & np.isfinite(maglimit)
+   drop = matched & (maglimit < ref)
+   for b in sorted(set(band[z])):
+       k = z & (band == b)
+       print(f"ztf depth {b}: {int((matched & k).sum())} of {int(k.sum())} epochs matched "
+             f"({(matched & k).sum() / k.sum():.4f}), {int((drop & k).sum())} shallower than reference dropped, "
+             f"{int((k & ~matched).sum())} unmatched kept")
+   return drop
 
 
 def ccd_reference_mags() -> pd.Series:

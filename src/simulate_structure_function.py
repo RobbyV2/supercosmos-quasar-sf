@@ -74,9 +74,10 @@ def simulate_mags(lc: pd.DataFrame, objids: np.ndarray, z: np.ndarray, sfinf: np
     return out + rng.normal(0.0, lc["magerr"].to_numpy()) if add_noise else out
 
 
-def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
+def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_real: int = 64, grid_n: int = 1 << 17,
                          long_n: int = 1 << 19, shapes: bool = True,
-                         on_noisy: Callable[..., None] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                         on_noisy: Callable[..., None] | None = None,
+                         redraw: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     from sf_model_checks import psd_grid
     lc = pd.read_parquet(_ROOT / LC_PARQUET, filters=[("band", "in", BANDS)])
     with np.load(_ROOT / "data/ensemble_sf_covariance.npz") as f:
@@ -107,30 +108,30 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
     base = pd.Series(0.0, index=pd.MultiIndex.from_frame(nightly[["OBJID", "band"]].drop_duplicates()))
     zero = np.zeros((len(objids), len(BANDS), NB, 3))
     sig = nightly.sig.to_numpy()
-    density = nightly.groupby("OBJID").size().reindex(objids).to_numpy()
-    amp_draw = np.clip(rng.normal(0, 0.2, len(objids)), -0.5, 0.5)
-    tau_draw = np.clip(rng.normal(0, 0.35, len(objids)), -0.8, 0.8)
+    rank = np.argsort(np.argsort(nightly.groupby("OBJID").size().reindex(objids).to_numpy()))
+    pop = lambda g: (np.clip(g.normal(0, 0.2, len(objids)), -0.5, 0.5),
+                     np.clip(g.normal(0, 0.35, len(objids)), -0.8, 0.8))
+    fixed = pop(rng)
     flat = np.zeros(len(objids))
-    fit = all_bin("drw")
     per = lambda d, v: np.outer(10 ** d, np.broadcast_to(v, len(BANDS)))
-    spread = lambda da, dtau, a=fit.sf_inf_mag, t=fit.tau_days: (per(da, a), per(dtau, t))
-    regimes = [("identical", "drw", grid_n, *spread(flat, flat), None),
-               ("heterogeneous", "drw", grid_n, *spread(amp_draw, tau_draw), None),
-               ("cadence_correlated", "drw", grid_n,
-                *spread(np.sort(amp_draw)[np.argsort(np.argsort(density))], tau_draw), None)]
+    spread = lambda da, dtau, a=drw[0], t=drw[1]: (per(da, a), per(dtau, t))
+    mixes = {"heterogeneous": lambda d: spread(*d),
+             "cadence_correlated": lambda d: spread(np.sort(d[0])[rank], d[1])}
+    regimes = [("identical", "drw", grid_n, spread(flat, flat), None)] + [
+        (k, "drw", grid_n, (lambda g, f=f: f(pop(g))) if redraw else f(fixed), None) for k, f in mixes.items()]
     if shapes:
         bend = all_bin("bending_psd")
         start = (pd.read_csv(_ROOT / "data/structure_function_fixed_population.csv")
                  .query("sample == 'fixed' and 400 < lag_center_days < 450").set_index("band").loc[list(BANDS)])
-        regimes += [("identical", psd, n, *spread(flat, flat, a, t), per(flat, alpha)) for n in (grid_n, long_n)
+        regimes += [("identical", psd, n, spread(flat, flat, a, t), per(flat, alpha)) for n in (grid_n, long_n)
                     for psd, a, t, alpha in (("bending", bend.sf_inf_mag, bend.tau_days, bend.alpha),
                                              ("power_law", np.sqrt(4 / np.pi) * start.sf_mag,
                                               start.lag_center_days, 2.0))]
     interp = psd_grid()
     rows, draws = [], []
     started = time.monotonic()
-    for case, (regime, psd, n, amp, tau, alpha) in enumerate(regimes):
-        frequency = np.fft.rfftfreq(n, 1.0)
+
+    def truths(amp, tau, alpha, frequency, n):
         truth, grid_truth = zero.copy(), zero.copy()
         for o, bi, _, ii, jj, bins, days in descriptors:
             a = None if alpha is None else alpha[o, bi]
@@ -143,9 +144,17 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
             truth[o, bi, :, 0] = grid_truth[o, bi, :, 0] = np.bincount(bins, minlength=NB)
             truth[o, bi, :, 1] = np.bincount(bins, weights=amp[o, bi] ** 2 * shape, minlength=NB)
             grid_truth[o, bi, :, 1] = np.bincount(bins, weights=covariance[0] - covariance[days], minlength=NB)
-        case_draws, coverage = [], []
+        return truth, grid_truth
+
+    for case, (regime, psd, n, params, alpha) in enumerate(regimes):
+        frequency = np.fft.rfftfreq(n, 1.0)
+        case_draws, coverage, inputs = [], [], []
         for realization in range(n_real):
             gen = np.random.default_rng(SEED + 1000 * case + realization)
+            if callable(params) or not inputs:
+                amp, tau = params(gen) if callable(params) else params
+                inputs.append(truths(amp, tau, alpha, frequency, n))
+            grid_truth = inputs[-1][1]
             intrinsic = simulate_mags(sim_lc, objids, z, amp, tau, gen, base,
                                       grid_n=n, add_noise=False, alpha=alpha)
             noisy = intrinsic + gen.normal(0, sig)
@@ -180,6 +189,7 @@ def aggregation_recovery(n_real: int = 64, grid_n: int = 1 << 17,
                 print(f"aggregation {regime} {psd} grid {n} {realization + 1}/{n_real}, "
                       f"elapsed {time.monotonic() - started:.1f} s", flush=True)
         draws += case_draws
+        truth, grid_truth = (np.mean(x, axis=0) for x in zip(*inputs))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             target_sf = np.sqrt(esf.ensemble_second_moment(truth))
@@ -227,7 +237,8 @@ def drw_excess_null(n_real: int = 64) -> pd.DataFrame:
               + " ".join(f"{r['band']} {r['drw_long_sigma_param_scaled']:.2f}" for r in new)
               + f", elapsed {time.monotonic() - started:.0f} s", flush=True)
 
-    aggregation_recovery(n_real, shapes=False, on_noisy=on_noisy)
+    fit = all_bin("drw")
+    aggregation_recovery((fit.sf_inf_mag, fit.tau_days), n_real, shapes=False, on_noisy=on_noisy)
     d = pd.DataFrame(rows)
     by = d.groupby(["regime", "band"], sort=False)[cols]
     hit = d[cols].ge(measured.loc[d.band].to_numpy())
@@ -247,7 +258,7 @@ if __name__ == "__main__":
     if "--excess-null" in sys.argv:
         drw_excess_null(64).to_csv(_ROOT / "data/structure_function_drw_excess_null.csv", index=False)
     elif "--aggregation-test" in sys.argv:
-        output, draws = aggregation_recovery(64, 1 << 17)
+        output, draws = aggregation_recovery((0.3, 600.0), 64, 1 << 17, redraw=True)
         output.to_csv(_ROOT / "data/structure_function_aggregation_recovery.csv", index=False)
         draws.to_csv(_ROOT / "temp/structure_function_aggregation_draws.csv", index=False)
     else:

@@ -11,7 +11,7 @@ from astropy.table import Table
 from scipy.spatial import cKDTree
 
 from assemble_lightcurves import (
-    _pava_decreasing, ccd_reference_mags, ccd_truncation_curve, field_coords,
+    _pava_decreasing, ccd_reference_mags, ccd_truncation_curve, field_coords, filters,
     plate_centres, sss_raw, assign_group_ids_by_sky, match_groups_to_catalog, redshifts, sdss_epochs,
 )
 
@@ -56,8 +56,6 @@ def catalog():
 
 def inputs():
     cat, prop = catalog()
-    macleod, _ = sdss_epochs()
-    cat = cat.assign(macleod=cat.OBJID.isin(macleod))
     lc = pd.read_parquet(DATA / "S82/total_lightcurves.parquet",
                          filters=[("band", "in", ["g", "r"])])
     lc["OBJID"] = lc.OBJID.astype(str)
@@ -65,6 +63,18 @@ def inputs():
     modern["night"] = np.floor(modern.time).astype(np.int64)
     nights = modern.groupby(["OBJID", "band", "survey", "night"], observed=True).mag.mean()
     stats = nights.groupby(["OBJID", "band", "survey"]).agg(["mean", "median", "count"]).reset_index()
+    band = {filters[b]: b for b in "gr"}
+    raw = pd.read_parquet(DATA / "S82/dr16s82_sdssLCRaw.parquet", columns=["objectId", "mjd", "psMag", "filterID"],
+                          filters=[("filterID", "in", list(band))])
+    sdss = raw.psMag.astype(float).groupby([raw.objectId.astype(str).rename("OBJID"), raw.filterID.map(band).rename("band"),
+                                            np.floor(raw.mjd).astype(np.int64).rename("night")]).mean()
+    sdss = sdss.groupby(["OBJID", "band"]).agg(["mean", "median", "count"])
+    macleod = stats[stats.survey == "sdss"].set_index(["OBJID", "band"])[["mean", "median"]]
+    if not macleod.index.isin(sdss.index).all():
+        raise ValueError("MacLeod quasar without raw SDSS photometry")
+    sdss.update(macleod)
+    stats = pd.concat([stats[stats.survey != "sdss"], sdss.reset_index().assign(survey="sdss")]).sort_values(
+        ["OBJID", "band", "survey"], ignore_index=True)
     ref = stats.groupby(["OBJID", "band"])["mean"].mean().unstack().reindex(cat.OBJID)
     original_median = modern.groupby(["OBJID", "band"]).mag.median()
     plates = lc.loc[lc.survey.str.startswith("sss")].copy()
@@ -169,8 +179,7 @@ def band_statistics(cat, stats, ref, interior, band, k=25, window=(17.75, 18.75)
         n = stats[(stats.band == band) & (stats.survey == name)].set_index("OBJID")["count"].reindex(cat.OBJID).fillna(0).to_numpy()
         bright = (mag >= window[0]) & (mag < window[1]) & (n > 0)
         neighbor = cKDTree(co[bright]).query(co, k=min(k, int(bright.sum())))[1]
-        ratio = n/n[bright][neighbor].mean(axis=1)
-        values[name] = (np.where(cat.macleod.to_numpy() | (name != "sdss"), ratio, np.nan), np.ones(len(cat), bool))
+        values[name] = (n/n[bright][neighbor].mean(axis=1), np.ones(len(cat), bool))
     return mag, inside, detected, values
 
 
@@ -303,6 +312,7 @@ def load_completeness_lightcurves(objids=None, remove_dropout=True):
     if objids is not None:
         filters.append(("OBJID", "in", list(map(str, objids))))
     df = pd.read_parquet(DATA / "S82/total_lightcurves.parquet", filters=filters)
+    df = df[~df.shallow].copy()
     df["OBJID"] = df.OBJID.astype(str)
     if remove_dropout:
         terms = pd.read_parquet(DATA / "detection_correction_components.parquet")

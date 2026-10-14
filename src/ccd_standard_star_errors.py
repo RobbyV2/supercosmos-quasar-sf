@@ -3,6 +3,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from assemble_lightcurves import shallow_epochs, ztf_maglimit
+
 
 _ROOT = Path(__file__).resolve().parents[1]
 SS = _ROOT / "temp/StandardStars"
@@ -66,13 +68,15 @@ def load_star_lcs(curves: dict) -> pd.DataFrame:
             "err_raw": s["psfMagErr"].to_numpy()}))
     for b in BANDS:
         s = pd.read_parquet(SS / f"ss_ZuberLC_{b}_clean.parquet",
-                            columns=["objectid", "mjd", "mag", "magerr"])
+                            columns=["objectid", "mjd", "mag", "magerr", "fieldid", "rcidin", "objra"]).assign(band=b)
         frames.append(pd.DataFrame({
             "OBJID": "z" + s["objectid"].astype(str), "survey": "ztf", "band": b,
             "time": s["mjd"].to_numpy(), "mag": s["mag"].to_numpy(),
-            "err_raw": s["magerr"].to_numpy()}))
+            "err_raw": s["magerr"].to_numpy(), "maglimit": ztf_maglimit(s)}))
     lc = pd.concat(frames, ignore_index=True)
     lc = lc[np.isfinite(lc["mag"]) & np.isfinite(lc["err_raw"]) & (lc["err_raw"] > 0)]
+    lc = lc[~shallow_epochs(lc["OBJID"].to_numpy(), lc["band"].to_numpy(), lc["survey"].to_numpy(),
+                            lc["mag"].to_numpy(), lc["maglimit"].to_numpy())]
     parts = []
     for (sv, b), s in lc.groupby(["survey", "band"], observed=True):
         s = s.copy()
