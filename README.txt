@@ -1,6 +1,6 @@
 Quasar ensemble structure functions over a 72-year baseline: SuperCOSMOS plates + SDSS/PS1/ZTF, Stripe 82.
 python3.12 -m venv .venv && py=.venv/bin/python && $py -m pip install -r requirements.txt
-included  data/: SDSS, SERC, POSS-I passbands; CALSPEC Vega; Vanden Berk composite; Roma-BZCAT; BOSZ and SDSS spectrum manifests; SuperCOSMOS wu_qso.hdf5, survey_table.fits
+included  data/: SDSS, SERC, POSS-I passbands; CALSPEC Vega; Vanden Berk composite; Roma-BZCAT; BOSZ and SDSS spectrum manifests; SuperCOSMOS wu_qso.hdf5, survey_table.fits; IRSA ZTF exposure metadata (ztf.ztf_current_meta_sci)
 supply    data/S82/{Catalog,dr16s82_sdssLCRaw,dr16s82_ps1LCRaw,dr16s82_ZuberLCRaw}.parquet (catalog, CCD light curves); data/StandardStars.zip, unzip -d temp (CCD standard stars); not included
 hosted    data/roe_stars.hdf5 (780.0 MB), host TBD
 fetch     curl -L http://quasar.astro.illinois.edu/paper_data/DR16Q/dr16q_prop_May01_2024.fits.gz | gunzip > data/dr16q_prop_May01_2024.fits
