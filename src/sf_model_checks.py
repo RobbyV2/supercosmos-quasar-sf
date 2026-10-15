@@ -375,13 +375,14 @@ def fit_range():
 def fiducial_nightly():
     from plate_completeness import load_completeness_lightcurves
     selected = [x for x in samples() if x[1] == 'fiducial']
-    nightly = esf.clean_nightly(load_completeness_lightcurves(np.unique(np.concatenate([x[3].index for x in selected]))))
+    lc = load_completeness_lightcurves(np.unique(np.concatenate([x[3].index for x in selected])))
+    nightly = esf.clean_nightly(lc)
     for band, _, base, p, _ in selected:
         n = nightly[nightly.band.eq(band) & nightly.OBJID.isin(p.index)].reset_index(drop=True)
         run = lambda x, ids=p.index.to_numpy(): esf.accumulate(x, ids, p.z, bands=[band], edges=esf.EDGES[:base.shape[1]+1], resid=True)[:, 0]
         real = run(n)
         np.testing.assert_allclose(real[..., :3], base[..., :3], rtol=1e-10, atol=1e-8)
-        yield band, base, p, n, run, real
+        yield band, base, p, n, run, real, lc
 
 
 def replace_plate_epochs(n, rng, variant):
@@ -404,7 +405,7 @@ def plate_replacement(n_rep=200):
     with np.load(OUT/'ensemble_sf_covariance.npz') as f:
         adopted = {b: f[f'replicates_{b}'] for b in esf.BANDS}
     rows, variants = [], ['ccd_night', 'ccd_survey', 'ccd_median']
-    for bi, (band, base, p, n, run, real) in enumerate(fiducial_nightly()):
+    for bi, (band, base, p, n, run, real, _) in enumerate(fiducial_nightly()):
         rng = np.random.default_rng(10050+bi)
         draws = {v: np.stack([run(replace_plate_epochs(n, rng, v)) for _ in range(n_rep)]) for v in variants}
         fixed_slots = [0, 2, 3, 4, 5]

@@ -437,10 +437,10 @@ def shallow_epochs(obj: np.ndarray, band: np.ndarray, survey: np.ndarray, mag: n
    drop = shallow | faint
    for b in sorted(set(band[z])):
        k = z & (band == b)
-       print(f"ztf depth {b}: {int((matched & k).sum())} of {int(k.sum())} epochs matched "
-             f"({(matched & k).sum() / k.sum():.4f}), {int((shallow & k).sum())} shallower than reference, "
+       print(f"{int(k.sum())} ztf {b} epochs, {int((matched & k).sum())} matched ({(matched & k).sum() / k.sum():.4f}), "
+             f"{int((shallow & k).sum())} shallower than reference, "
              f"{int((faint & k).sum())} from {len(set(obj[faint & k]))} sources fainter than {ZTF_FAINT}, "
-             f"{int((drop & k).sum())} dropped, {int((k & ~matched).sum())} unmatched kept")
+             f"{int((drop & k).sum())} dropped, {int((k & ~matched & ~drop).sum())} unmatched kept")
    return drop
 
 
