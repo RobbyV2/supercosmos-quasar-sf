@@ -150,9 +150,12 @@ def analyse(cache, sample, n_boot):
         selected = s.adopted_keep.fillna(False).to_numpy(bool)
         fiducial = selected & (acc[:, bi, 0, 0, :endpoint + 1, 0] > 0).all(axis=1)
         parent = (acc[:, bi, 0, 0, :, 0] > 0).any(axis=1)
-        memberships.extend(dict(OBJID=o, band=band, full_parent=bool(p), selected=bool(v), fiducial=bool(f))
-                           for o, p, v, f in zip(ids, parent, selected, fiducial))
-        for name, mask in (("full_parent", parent), ("selected", selected), ("fiducial", fiducial)):
+        plate_sdss = s[["plate_detected", "sdss"]].fillna(False).all(axis=1).to_numpy(bool)
+        memberships.extend(dict(OBJID=o, band=band, full_parent=bool(p), selected=bool(v), fiducial=bool(f),
+                                plate_ccd_sdss=bool(n))
+                           for o, p, v, f, n in zip(ids, parent, selected, fiducial, plate_sdss))
+        for name, mask in (("full_parent", parent), ("selected", selected), ("fiducial", fiducial),
+                           ("plate_ccd_sdss", plate_sdss)):
             a, oid = acc[mask, bi], ids[mask]
             point = esf.ensemble_second_moment(a)
             bounds, reps = esf.object_bootstrap(a, n_boot=n_boot, seed=928 + bi)
@@ -168,9 +171,9 @@ def analyse(cache, sample, n_boot):
                 common = both[:, ki]
                 ncommon = common.sum(axis=0)
                 count = a[:, ki, :, :, 0].sum(axis=0)
-                common_point = esf.ensemble_second_moment(a[:, ki], weights=common[:, None, :])
+                cbeta = asymmetry(esf.ensemble_second_moment(a[:, ki], weights=common[:, None, :]))
                 for k in range(esf.NB):
-                    valid = ((nobj[1, k] >= 20) & (nobj[2, k] >= 20) & np.isfinite(beta[ki, k])
+                    valid = ((nobj[1, k] >= 20) & (nobj[2, k] >= 20) & np.isfinite(beta[ki, k]) & np.isfinite(cbeta[k])
                              & (k <= endpoint if name == "fiducial" else True))
                     blo, bmid, bhi = pct(breps[:, ki, k], [16, 50, 84])
                     clo, chi = pct(cbreps[:, ki, k], [16, 84])
@@ -178,7 +181,7 @@ def analyse(cache, sample, n_boot):
                                lag_center_days=esf.CENTERS[k], lag_lo_days=esf.EDGES[k], lag_hi_days=esf.EDGES[k+1],
                                n_sample=len(oid), n_common_sign_objects=int(ncommon[k]), reportable=bool(valid),
                                beta=beta[ki, k], beta_lo=blo, beta_hi=bhi,
-                               beta_common_objects=asymmetry(common_point)[k],
+                               beta_common_objects=cbeta[k],
                                beta_common_lo=clo, beta_common_hi=chi)
                     for j, sign in enumerate(SIGNS):
                         row.update({f"{sign}_n_objects":int(nobj[j, k]), f"{sign}_n_pairs":int(count[j, k]),
@@ -202,7 +205,7 @@ def analyse(cache, sample, n_boot):
                 np.testing.assert_allclose(amplitude(point[0, 0, :endpoint + 1]), expected.sf_mag, rtol=1e-10)
                 if len(oid) != int(expected.n_objects.iloc[0]):
                     raise AssertionError("fiducial membership differs from adopted sample")
-            if name != "full_parent":
+            if name in ("selected", "fiducial"):
                 keys = cache["draw_keys"]
                 take = (keys[:, 1] == band) & np.isin(keys[:, 0], oid)
                 positions = {o: i for i, o in enumerate(oid)}
@@ -247,6 +250,8 @@ def main():
     esf.check_flags(__file__)
     sample = pd.read_parquet(ROOT / "data/plate_completeness_sample.parquet")
     sample["OBJID"] = sample.OBJID.astype(str)
+    sdss = pd.read_parquet(ROOT / esf.LC_PARQUET, columns=["OBJID", "band"], filters=[("survey", "==", "sdss")])
+    sample["sdss"] = pd.MultiIndex.from_frame(sample[["OBJID", "band"]]).isin(pd.MultiIndex.from_frame(sdss))
     analyse(build_cache(sample, 1000), sample, 3000)
 
 
