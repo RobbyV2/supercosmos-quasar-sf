@@ -405,6 +405,7 @@ CCD_MIN_FRAC = 0.2
 CCD_VALID_MAX = 22.4
 ZTF_META = _ROOT / "data/ztf/ztf_current_meta_sci.csv.gz"
 ZTF_FAINT = 20.0
+PS1_MAG_RANGE = (10.0, 25.0)
 PALOMAR = EarthLocation.from_geodetic(-116.863 * u.deg, 33.356 * u.deg, 1706 * u.m)
 
 
@@ -611,6 +612,9 @@ def main() -> None:
    ref = ccd_reference_mags()
    # CCD surveys detection limited (ZTF first): same treatment as plates before medians
    df_base = apply_ccd_truncation(df_base, build_ccd_truncation(df_base, ref), ref)
+   bad = (df_base["survey"] == "ps1") & ~df_base["mag"].between(*PS1_MAG_RANGE)
+   print(f"ps1 epochs outside {PS1_MAG_RANGE} mag dropped: {int(bad.sum())}")
+   df_base = df_base[~bad]
 
    df_sss = native_longform()
 
