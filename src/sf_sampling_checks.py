@@ -137,7 +137,7 @@ def paired_single_bootstrap(draws, acc, n_boot, seed):
     return out
 
 
-def analyse(cache, sample, n_boot):
+def analyze(cache, sample, n_boot):
     ids, acc = cache["ids"], cache["acc"]
     summaries, tests, single_rows, memberships = [], [], [], []
     covariance = dict(lag_edges=esf.EDGES, pair_classes=np.array(KINDS), signs=np.array(SIGNS),
@@ -252,7 +252,7 @@ def main():
     sample["OBJID"] = sample.OBJID.astype(str)
     sdss = pd.read_parquet(ROOT / esf.LC_PARQUET, columns=["OBJID", "band"], filters=[("survey", "==", "sdss")])
     sample["sdss"] = pd.MultiIndex.from_frame(sample[["OBJID", "band"]]).isin(pd.MultiIndex.from_frame(sdss))
-    analyse(build_cache(sample, 1000), sample, 3000)
+    analyze(build_cache(sample, 1000), sample, 3000)
 
 
 if __name__ == "__main__":

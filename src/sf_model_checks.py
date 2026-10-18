@@ -50,6 +50,14 @@ def psd_grid():
     return RegularGridInterpolator((ALPHA, g.grid[1]), g.values[:len(ALPHA)], bounds_error=True)
 
 
+def mean_lag(f, band):
+    return (f[f'lag_weights_{band}']*f[f'lag_nodes_{band}']).sum(-1)
+
+
+def bin_lag(a, lag):
+    return np.nanmean(np.where(a[...,0] > 0, lag, np.nan), axis=0)
+
+
 def samples():
     with np.load(OUT/'ensemble_sf_covariance.npz') as f:
         boot = {k:f[k] for k in f.files}
@@ -72,7 +80,7 @@ def samples():
             raise ValueError('sampling and ensemble archives disagree')
         p = prop.reindex(oid).copy()
         p['z'] = catalog[catalog.band.eq(band)].set_index('OBJID').reindex(oid).z
-        kernel = tuple(boot[f'lag_{key}_{band}'] for key in ['nodes','weights','counts'])
+        lag = mean_lag(boot, band)
         masks = {'fiducial':np.ones(len(oid),bool)}
         for i,ml in enumerate(['lowmbh','highmbh']):
             for j,el in enumerate(['lowedd','highedd']):
@@ -89,7 +97,7 @@ def samples():
                 if m.sum() >= 20:
                     masks[f'grid_{i}_{j}'] = m
         for name,keep in masks.items():
-            yield band,name,a[keep],p.iloc[np.flatnonzero(keep)],tuple(v[keep] for v in kernel)
+            yield band,name,a[keep],p.iloc[np.flatnonzero(keep)],lag[keep]
 
 
 def adopted_reps(band, name, a):
@@ -101,16 +109,17 @@ def covariance(reps):
     return esf.ledoit_wolf(reps/sd)[0]*np.outer(sd,sd)
 
 
-def all_bin_fits(a, grid, reps):
+def all_bin_fits(a, grid, reps, lag):
     sf = np.sqrt(np.maximum(esf.object_second_moments(a).mean(axis=0),0))
     use = sf > 0
     dt,y,n = fsf.CENTERS[:len(sf)][use],sf[use],int(use.sum())
+    lag = bin_lag(a, lag)[use]
     err,C = reps[:,use].std(axis=0,ddof=1),covariance(reps[:,use])
     w,full,long = err**-2,cho_factor(C),dt > fsf.LONG_MIN_D
     prec = np.sqrt(np.diag(cho_solve(full,np.eye(n))))
     lo,hi = grid.grid[1][[0,-1]]
-    shape = lambda t,alpha:np.sqrt(-np.expm1(-dt/10**t) if alpha == 0 else
-                                   grid(np.column_stack([np.full(n,alpha),np.clip(np.log10(dt)-t,lo,hi)])))
+    shape = lambda t,alpha:np.sqrt(-np.expm1(-lag/10**t) if alpha == 0 else
+                                   grid(np.column_stack([np.full(n,alpha),np.clip(np.log10(lag)-t,lo,hi)])))
     def trial(t,alpha):
         u = shape(t,alpha)
         amp = (w*u)@y/((w*u)@u)
@@ -153,9 +162,9 @@ def all_bin_fits(a, grid, reps):
             row.update(final_lag_days=dt[-1],final_resid_mag=r[-1],long_n_bins=int(long.sum()),
                        final_resid_err_mag_param_scaled=np.sqrt(cr[-1,-1]),final_sigma_param_scaled=r[-1]/np.sqrt(cr[-1,-1]),
                        long_chi2_param_scaled=x,long_pvalue_param_scaled=pl,long_sigma_param_scaled=norm.isf(pl/2))
-        resid += [dict(model=name,lag_center_days=t,sf_mag=v,sf_err_mag=s,model_mag=m,relative_residual=v/m-1,
+        resid += [dict(model=name,lag_center_days=t,lag_days=l,sf_mag=v,sf_err_mag=s,model_mag=m,relative_residual=v/m-1,
                        relative_residual_err=s/m,chi2_contribution=c2,conditional_pull=pull)
-                  for t,v,s,m,c2,pull in zip(dt,y,err,pred,r*ci,ci/prec)]
+                  for t,l,v,s,m,c2,pull in zip(dt,lag,y,err,pred,r*ci,ci/prec)]
     B = fits['bending_psd']
     d = fits['drw']['chi2_diag']-B['chi2_diag']
     pv,pf = chi2.sf(d,1),fdist.sf(d/max(B['reduced_chi2_diag'],1.),1,B['dof'])
@@ -232,13 +241,13 @@ def greedy(a,stat,steps=2,key=lambda s:s):
 def lowmass_influence():
     grid,rows=psd_grid(),[]
     keys=['final_resid_mag','final_resid_err_mag_param_scaled','final_sigma_param_scaled','long_sigma_param_scaled']
-    for band,name,a,prop,_ in samples():
+    for band,name,a,prop,lag in samples():
         if name not in GROUPS[:2]:
             continue
         ids=prop.index.to_numpy(str)
-        def drw(a):
-            return next(f for f in all_bin_fits(a,grid,adopted_reps(band,name,a))[0] if f['model']=='drw')
-        (_,f),*drops=greedy(a,drw,key=lambda f:f['long_sigma_param_scaled'])
+        def drw(i):
+            return next(f for f in all_bin_fits(a[i],grid,adopted_reps(band,name,a[i]),lag[i])[0] if f['model']=='drw')
+        (_,f),*drops=greedy(np.arange(len(a)),drw,key=lambda f:f['long_sigma_param_scaled'])
         row=dict(band=band,sample=name,n_objects=len(a),final_lag_days=f['final_lag_days'],long_n_bins=f['long_n_bins'],**{k:f[k] for k in keys})
         for n,(i,d) in enumerate(drops,1):
             row.update({f'drop{n}_objid':ids[i],**{f'drop{n}_{k}':d[k] for k in keys}})
@@ -442,9 +451,9 @@ def plate_replacement(n_rep=200):
 def main():
     grid=psd_grid()
     narrow,properties,narrow_curves,all_fits,all_resid=[],[],[],[],[]
-    for index,(band,name,a,prop,_) in enumerate(samples()):
+    for index,(band,name,a,prop,lag) in enumerate(samples()):
         print(f'{band} {name}: {len(a)} objects',flush=True)
-        ff,rr=all_bin_fits(a,grid,adopted_reps(band,name,a))
+        ff,rr=all_bin_fits(a,grid,adopted_reps(band,name,a),lag)
         all_fits+=[{'band':band,'sample':name,'n_objects':len(a),**x} for x in ff]
         all_resid+=[{'band':band,'sample':name,**x} for x in rr]
         nr,pr,nc=nested_checks(a,prop,2928+index)

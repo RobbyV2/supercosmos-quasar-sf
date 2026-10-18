@@ -118,7 +118,7 @@ def native_calibration():
     coefficients, validation, held, coverage = [], [], [], []
     folds = star_fold(stars.index)
     eligible = stars.fit_ok.to_numpy(bool) & (folds != 4)
-    centers = al.plate_centres()
+    centers = al.plate_centers()
     for plate, d in det.groupby("plate", sort=True):
         d = d[d.fit_ok & np.isfinite(d.expected+d.expected_error)].copy()
         train = d.fold.ne(4)

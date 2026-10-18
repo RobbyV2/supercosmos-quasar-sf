@@ -215,21 +215,23 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
 
 
 def drw_excess_null(n_real: int = 64) -> pd.DataFrame:
-    from sf_model_checks import adopted_reps, all_bin_fits, psd_grid
+    from sf_model_checks import adopted_reps, all_bin_fits, mean_lag, psd_grid
     grid = psd_grid()
     cols = [f"{m}_{k}" for m, keys in ALL_BIN.items() for k in keys]
     measured = pd.concat([all_bin(m)[list(keys)].add_prefix(f"{m}_") for m, keys in ALL_BIN.items()], axis=1)
     with np.load(_ROOT / "data/ensemble_sf_covariance.npz") as f:
-        fiducial = {b: (f[f"objids_{b}"].astype(str), f[f"lag_counts_{b}"].shape[1]) for b in BANDS}
+        fiducial = {b: (f[f"objids_{b}"].astype(str), f[f"lag_counts_{b}"].shape[1], mean_lag(f, b)) for b in BANDS}
     rows = []
     started = time.monotonic()
 
     def on_noisy(regime, realization, acc, objids):
         new = []
         for bi, b in enumerate(BANDS):
-            ids, nb = fiducial[b]
-            a = acc[np.isin(objids, ids), bi, :nb]
-            fits = pd.DataFrame(all_bin_fits(a, grid, adopted_reps(b, "fiducial", a))[0]).set_index("model")
+            ids, nb, lag = fiducial[b]
+            keep = np.isin(objids, ids)
+            a = acc[keep, bi, :nb]
+            fits = pd.DataFrame(all_bin_fits(a, grid, adopted_reps(b, "fiducial", a),
+                                             lag[pd.Index(ids).get_indexer(objids[keep])])[0]).set_index("model")
             new.append(dict(regime=regime, band=b, realization=realization,
                             **{f"{m}_{k}": fits.at[m, k] for m, keys in ALL_BIN.items() for k in keys}))
         rows.extend(new)

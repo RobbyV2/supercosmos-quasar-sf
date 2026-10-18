@@ -12,7 +12,7 @@ from scipy.spatial import cKDTree
 
 from assemble_lightcurves import (
     _pava_decreasing, ccd_reference_mags, ccd_truncation_curve, field_coords, filters,
-    plate_centres, sss_raw, assign_group_ids_by_sky, match_groups_to_catalog, redshifts, sdss_epochs,
+    plate_centers, sss_raw, assign_group_ids_by_sky, match_groups_to_catalog, redshifts, sdss_epochs,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -143,7 +143,7 @@ def opportunities(cat, prop, ref, plates):
 
 
 def footprint(cat, zp):
-    ctr = plate_centres()
+    ctr = plate_centers()
     for p in zp[zp.survey.isin(SERIES)].itertuples():
         xi, eta = field_coords(np.full(len(cat), p.plate), cat.RA.to_numpy(), cat.DEC.to_numpy(), ctr)
         edge = np.minimum.reduce([xi-p.xi_lo, p.xi_hi-xi, eta-p.eta_lo, p.eta_hi-eta])

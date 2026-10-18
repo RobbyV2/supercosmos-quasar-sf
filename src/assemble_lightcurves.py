@@ -12,6 +12,7 @@ from astropy.time import Time
 from scipy.optimize import curve_fit
 from scipy.stats import norm
 import astropy.units as u
+from qsogen import model_colours as mc
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,6 +53,22 @@ def ab_minus_vega(wf, tf):
    d = fits.getdata(_ROOT / "data/alpha_lyr_stis_012.fits", 1)
    return abmag(vac_to_air(np.asarray(d["WAVELENGTH"], dtype=float)), np.asarray(d["FLUX"], dtype=float),
                 np.asarray(wf, dtype=float), np.asarray(tf, dtype=float))
+
+
+SDSS_PS1 = [tuple((np.asarray(mc.wavarrs[f"{s}_{b}"], float), np.asarray(mc.resparrs[f"{s}_{b}"], float))
+                  for s in ("SDSS", "PS1")) for b in "griz"]
+
+
+def composite_colors(z_vals, pairs):
+   tbl = Table.read(str(_ROOT / "data/vandenberk_qso_composite_cds.txt"), format="ascii.cds")
+   wr, fr = np.asarray(tbl["Wave"], float), np.asarray(tbl["FluxD"], float)
+   cache, out = {}, np.full((len(z_vals), len(pairs)), np.nan)
+   for k, z in enumerate(z_vals):
+      if z not in cache:
+         lam, fo = wr * (1 + z), fr / (1 + z)
+         cache[z] = [abmag(lam, fo, *a) - abmag(lam, fo, *b) for a, b in pairs]
+      out[k] = cache[z]
+   return out
 
 
 filters = {"u": 0, "g": 1, "r": 2, "i": 3, "z": 4, "y": 5}
@@ -108,10 +125,14 @@ def concat_light_curves_df(
            "z": cat_keys["sdss_z_qg"].values - cat_keys["ps1_z_qg"].values,
        }
    )
+   griz = list("griz")
+   miss = offset_wide[griz].isna().any(axis=1)
+   comp = composite_colors(np.round(redshift(cat_keys[miss]), 3), SDSS_PS1)
+   offset_wide[griz] = offset_wide[griz].fillna(pd.DataFrame(comp, offset_wide.index[miss], griz))
+   print(f"composite SDSS-PS1 offsets for {int(miss.sum())} quasars without a qsogen fit")
    offset_long = offset_wide.melt(id_vars=["objectId"], var_name="band", value_name="offset")
    u_offsets = pd.DataFrame({"objectId": cat_keys["objectId"].values, "band": "u", "offset": 0.0})
    offset_long = pd.concat([offset_long, u_offsets], ignore_index=True)
-   offset_long["offset"] = pd.to_numeric(offset_long["offset"], errors="coerce").fillna(0.0)
 
    band_map = pd.DataFrame({"band": bands_sdss, "filterID": [filters[b] for b in bands_sdss]})
 
@@ -140,8 +161,9 @@ def concat_light_curves_df(
 
    ps1_df = ps1_df.merge(offset_long, on=["objectId", "band"], how="left")
    ztf_df = ztf_df.merge(offset_long, on=["objectId", "band"], how="left")
-   ps1_df["mag"] = ps1_df["mag"] + ps1_df["offset"].fillna(0.0)
-   ztf_df["mag"] = ztf_df["mag"] + ztf_df["offset"].fillna(0.0)
+   ps1_df["mag"] = ps1_df["mag"] + ps1_df["offset"]
+   ztf_df["mag"] = ztf_df["mag"] + ztf_df["offset"]
+   print(f"ps1/ztf epochs without an SDSS-PS1 offset dropped: {int(ps1_df['offset'].isna().sum() + ztf_df['offset'].isna().sum())}")
    ps1_df = ps1_df.drop(columns=["offset"])
    ztf_df = ztf_df.drop(columns=["offset"])
 
@@ -375,7 +397,7 @@ def star_sky_positions() -> np.ndarray:
       return np.array([k.split("_") for k in f.keys()], dtype=float)
 
 
-def plate_centres() -> pd.DataFrame:
+def plate_centers() -> pd.DataFrame:
    with fits.open(_ROOT / "data/survey_table.fits") as h:
       t = h[1].data
       return (pd.DataFrame({"plate": np.asarray(t["PLATEID"]).ravel().astype(np.int64),
@@ -386,7 +408,7 @@ def plate_centres() -> pd.DataFrame:
 
 def field_coords(plate: np.ndarray, ra: np.ndarray, dec: np.ndarray,
                  ctr: pd.DataFrame | None = None) -> tuple[np.ndarray, np.ndarray]:
-   c = plate_centres() if ctr is None else ctr
+   c = plate_centers() if ctr is None else ctr
    xi = ((((ra - c["cra"].reindex(plate).to_numpy()) + 180.0) % 360.0) - 180.0)
    return xi * np.cos(np.deg2rad(dec)), dec - c["cdec"].reindex(plate).to_numpy()
 
