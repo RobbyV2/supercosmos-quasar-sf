@@ -41,12 +41,19 @@ def native_design(m, xi, eta, center, scale, degree, spatial):
                             native_field(xi, eta, spatial)])
 
 
+HUBER_K = 1.345
+
+
+def huber_loss(r):
+    return np.where(np.abs(r) <= HUBER_K, .5*r*r, HUBER_K*(np.abs(r)-.5*HUBER_K))
+
+
 def native_robust_fit(A, y):
     c = np.linalg.lstsq(A, y, rcond=None)[0]
     for _ in range(8):
         r = y-A@c
         scale = max(al._mad_sigma(r), .01)
-        w = np.sqrt(np.minimum(1., 1.345*scale/np.maximum(np.abs(r), 1e-12)))
+        w = np.sqrt(np.minimum(1., HUBER_K*scale/np.maximum(np.abs(r), 1e-12)))
         c = np.linalg.lstsq(A*w[:, None], y*w, rcond=None)[0]
     return c, scale
 
@@ -161,7 +168,7 @@ def native_calibration():
                     derivative = 1+np.polynomial.legendre.legval(grid,np.polynomial.legendre.legder(c[:degree+1]))/scale
                     valid &= bool((derivative>.2).all())
                     r = (y[~pick]-A[~pick]@c)/sig
-                    losses.append(float(np.mean(np.where(np.abs(r)<=1.345,.5*r*r,1.345*(np.abs(r)-.5*1.345)))*sig**2))
+                    losses.append(float(np.mean(huber_loss(r))*sig**2))
                 trial = dict(plate=int(plate),degree=degree,spatial=spatial,loss=np.mean(losses),
                              loss_se=np.std(losses,ddof=1)/2,monotone=valid,
                              **{f"fold_loss_{k}":value for k,value in enumerate(losses)})
@@ -238,7 +245,7 @@ def native_quasars():
     q["native"] = q.SURVEYNAME.map(NATIVE_BAND)
     q.loc[q.PLATEID.isin((131900,131903)),"native"] = "tp"
     q["band"] = q.SURVEYNAME.map(al.SURVEY_SDSS_BAND)
-    coefficients = pd.read_csv(NATIVE_WORK/"coefficients.csv").set_index("plate")
+    coefficients = pd.read_csv(NATIVE_WORK/"coefficients.csv",float_precision="round_trip").set_index("plate")
     xi,eta = al.field_coords(q.PLATEID.to_numpy(),q.RA.to_numpy(),q.DEC.to_numpy())
     q["native_mag"],q["response_derivative"],q["supported"] = np.nan,np.nan,False
     for plate, idx in q.groupby("PLATEID").groups.items():
@@ -341,7 +348,7 @@ def native_validation():
 def native_noise():
     from scipy.optimize import nnls
     stars,det=native_inputs()
-    coefficients=pd.read_csv(NATIVE_WORK/"coefficients.csv").set_index("plate")
+    coefficients=pd.read_csv(NATIVE_WORK/"coefficients.csv",float_precision="round_trip").set_index("plate")
     rows=[]
     for plate,d in det[det.fit_ok].groupby("plate"):
         if plate not in coefficients.index:continue

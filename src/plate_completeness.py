@@ -107,7 +107,7 @@ def opportunities(cat, prop, ref, plates):
     kept = set(zip(plates.OBJID, plates.plate.astype(int)))
     flagged = set(zip(plates.loc[~plates.calib_ok, "OBJID"], plates.loc[~plates.calib_ok, "plate"].astype(int)))
     rows = []
-    for p, k, edge in footprint(cat, pd.read_csv(DATA / "plate_native_calibration.csv")):
+    for p, k, edge in footprint(cat, pd.read_csv(DATA / "plate_native_calibration.csv", float_precision="round_trip")):
         ind = pd.MultiIndex.from_arrays([k, np.full(len(k), p.plate)])
         sep = raw.reindex(ind).to_numpy()
         obj = cat.OBJID.iloc[k].to_numpy()

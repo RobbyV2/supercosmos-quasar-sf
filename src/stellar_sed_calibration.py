@@ -21,7 +21,7 @@ BANDS = dict(zip("ugriz", [f"SLOAN_SDSS.{b}.dat" for b in "ugriz"]))
 BANDS.update(bj="serc-j.txt", r_native="serc-r.txt", e="possi-e.txt", tp="techpan_og590.txt")
 EBV = np.arange(0., .551, .005)
 SED_CHI2_MAX = 25.
-BJ_RESPONSE_POWER = 2.
+BJ_RESPONSE_POWER = 1.5
 PASSBAND_URLS = dict(
     parker="https://www.cambridge.org/core/services/aop-cambridge-core/content/view/878CF0C11CE7BC44BCA9294637F46981/S132335800000597Xa.pdf/the-introduction-of-tech-pan-film-at-the-uk-schmidt-telescope.pdf",
     schott="https://www.schott.com/-/media/project/onex/products/o/optical-filter-glass/downloads/schott-datasheet-collection-filter-en_112019.pdf?rev=766d730fb2ac41fd82165f3f74ee7ae3")
@@ -97,9 +97,9 @@ def _weights(wave: np.ndarray, wf: np.ndarray, tf: np.ndarray) -> np.ndarray:
             + np.bincount(ix + 1, weights * frac, minlength=len(wave)))
 
 
-def bj_response() -> tuple[np.ndarray, np.ndarray]:
+def bj_response(power: float | None = None) -> tuple[np.ndarray, np.ndarray]:
     w, t = al.read_bandpass(BANDS["bj"])
-    return w, t * (w / np.sqrt(w.min() * w.max())) ** BJ_RESPONSE_POWER
+    return w, t * (w / np.sqrt(w.min() * w.max())) ** (BJ_RESPONSE_POWER if power is None else power)
 
 
 def model_grid(energy: bool = False, og590: bool = False, bj_factor: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -109,7 +109,7 @@ def model_grid(energy: bool = False, og590: bool = False, bj_factor: bool = Fals
     if og590:
         key, vkey = "magnitudes_og590", "vega_og590"
     if bj_factor:
-        key, vkey = "magnitudes_bj_factor", "vega_bj_factor"
+        key, vkey = f"magnitudes_bj_factor_{BJ_RESPONSE_POWER:g}", f"vega_bj_factor_{BJ_RESPONSE_POWER:g}"
     if path.exists():
         d = np.load(path)
         if key in d:
