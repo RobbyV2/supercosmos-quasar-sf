@@ -152,6 +152,13 @@ def footprint(cat, zp):
 
 
 def binned_curve(mag, value, keep, width=0.25, min_n=20, start=18.5, level=0.9, monotone=True):
+    """Recovery against magnitude and where it drops below level
+
+    Returns
+        bins (n, 4): center mag, objects, mean, SE
+        fit, non-increasing in magnitude if monotone
+        limit mag, inf if never below level
+    """
     rows = []
     edges = np.arange(17.5, 23.51, width)
     for lo, hi in zip(edges[:-1], edges[1:]):
@@ -327,6 +334,13 @@ def load_completeness_lightcurves(objids=None, remove_dropout=True):
 
 
 def _property_weights(features, cells, selected, counts, target, theta=None):
+    """Entropy-balancing weights: target cell masses and target feature means
+
+    Returns
+        weight per object
+        dual coefficients, warm start for the next call
+        largest balance residual
+    """
     from scipy.optimize import minimize
     from scipy.special import logsumexp
 

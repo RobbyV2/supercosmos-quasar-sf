@@ -29,6 +29,11 @@ for name, fname in SSS_FILTERS.items():
     mc.zeropoints[name + "_AB"] = 0.1088544752 * mc.simps(Tf / fine, fine)
 
 def _native_sed_row(args):
+    """Native terms of one quasar from the composite and from its qsogen fit
+
+    term = catalog SDSS g (B_J) or r (red series) minus native Vega magnitude
+    Returns one row per native band
+    """
     from qsogen.qsosed import Quasar_sed
     from stellar_sed_calibration import redden
 
@@ -80,6 +85,7 @@ def native_sed_control():
 
 
 def observed_sed_control(manifest_path=None, output=None):
+    """Native terms measured on archived SDSS spectra, beside the composite and qsogen terms"""
     from astropy.io import fits
     from stellar_sed_calibration import _weights
 

@@ -19,6 +19,10 @@ QSO_SPECS = {"sdss": ("dr16s82_sdssLCRaw", "psMag", "psMagErr", "psMagErr_p3", "
 
 
 def excess_curves() -> dict[tuple[str, str], tuple[np.ndarray, np.ndarray]]:
+    """Excess error of the _p3 columns against magnitude, from the quasar light curves
+
+    Returns {(survey, band): (mag, excess)}; SDSS excess applies from MJD 53500
+    """
     curves = {}
     for sv, (f, mc, rc, pc, tc) in QSO_SPECS.items():
         d = pd.read_parquet(_ROOT / f"data/S82/{f}.parquet", columns=[mc, rc, pc, "filterID", tc])
@@ -49,6 +53,11 @@ def apply_excess(mag: np.ndarray, raw: np.ndarray, sv: str, b: str, t: np.ndarra
 
 
 def load_star_lcs(curves: dict) -> pd.DataFrame:
+    """Standard-star SDSS, PS1 and ZTF epochs
+
+    Shallow ZTF epochs dropped, as for the quasars
+    err_used: raw error and _p3 excess in quadrature
+    """
     frames = []
     d = pd.read_parquet(SS / "ss_SDSSLC_clean.parquet",
                         columns=["ssID", "mjd", "psMag", "psMagErr", "filterID"])

@@ -78,6 +78,7 @@ bands_sdss = ["u", "g", "r", "i", "z"]
 def sdss_epochs() -> tuple[pd.Index, pd.DataFrame]:
    with tarfile.open(_ROOT / "data/S82/macleod2012_s82_lightcurves.tar.gz") as t:
        files = [(m.name.rsplit("/", 1)[1], t.extractfile(m).read()) for m in t if m.isfile()]
+   # 17 columns: MJD, mag, err for each of ugriz, then RA, Dec
    a = np.array(b"".join(f for _, f in files).split(), dtype=float).reshape(-1, 17)
    dbid = np.repeat([n for n, _ in files], [f.count(b"\n") for _, f in files])
    _, first = np.unique(dbid, return_index=True)
@@ -94,6 +95,11 @@ def concat_light_curves_df(
    skip=None,
    N=None,
 ):
+   """SDSS, PS1 and ZTF epochs of the catalog quasars on the SDSS system
+
+   PS1 and ZTF shifted by each quasar's SDSS-PS1 color, composite color if it has no fit
+   Returns long frame: objectId, band, time, mag, magerr, survey, shallow (ZTF rows)
+   """
    data_dir = _ROOT / "data/S82"
    cat = pd.read_parquet(data_dir / "Catalog.parquet").set_index("idx")
 
@@ -408,6 +414,12 @@ def plate_centers() -> pd.DataFrame:
 
 def field_coords(plate: np.ndarray, ra: np.ndarray, dec: np.ndarray,
                  ctr: pd.DataFrame | None = None) -> tuple[np.ndarray, np.ndarray]:
+   """Offsets from the plate center, in degrees
+
+   Returns
+      xi   RA offset times cos(dec)
+      eta  Dec offset
+   """
    c = plate_centers() if ctr is None else ctr
    xi = ((((ra - c["cra"].reindex(plate).to_numpy()) + 180.0) % 360.0) - 180.0)
    return xi * np.cos(np.deg2rad(dec)), dec - c["cdec"].reindex(plate).to_numpy()

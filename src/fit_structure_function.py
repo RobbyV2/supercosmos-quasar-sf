@@ -102,6 +102,7 @@ GROUPS = ("lowmbh_lowedd", "lowmbh_highedd", "highmbh_lowedd", "highmbh_highedd"
 
 
 def bootstrap_plan(band, name):
+    """(n_boot, seed) of the fiducial sample, the four groups or a grid_i_j cell"""
     bi = BANDS.index(band)
     match name.split("_"):
         case ["fiducial"]:
@@ -156,6 +157,13 @@ def _object_summary(a, z, lum, n_boot=5000, seed=31, weights=None):
 
 
 def _object_lag_kernel(nightly, ids, zmap, n_bins, subdivisions=32):
+    """Rest-frame pair lags of each quasar within each bin, on log sub-bins
+
+    Returns
+        nodes, mean lag per sub-bin (quasar, bin, subdivisions), days
+        weights, fraction of the bin's pairs per sub-bin
+        count, pairs per quasar and bin
+    """
     nodes = np.zeros((len(ids), n_bins, subdivisions))
     weights = np.zeros_like(nodes)
     count = np.zeros((len(ids), n_bins), dtype=int)
@@ -176,6 +184,10 @@ def _object_lag_kernel(nightly, ids, zmap, n_bins, subdivisions=32):
 
 
 def _object_rises(a, reps, name, band):
+    """SF rise of each bin beyond 11 rest-frame years over the bin nearest 2371 d
+
+    reps: bootstrap SF replicates (n_boot, bin), mag
+    """
     sf = _object_amplitude(esf.ensemble_second_moment(a))
     k0 = int(np.argmin(abs(CENTERS[:len(sf)]-2371)))
     rise = []

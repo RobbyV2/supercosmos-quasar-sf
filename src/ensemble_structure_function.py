@@ -13,6 +13,7 @@ from astropy.io import fits
 _ROOT = Path(__file__).resolve().parents[1]
 CACHE = _ROOT / "temp/cache"
 BANDS = ["g", "r"]
+# rest-frame lag bins, 0.25 dex
 EDGES = np.logspace(0.75, 4.5, 16)
 CENTERS = np.sqrt(EDGES[:-1] * EDGES[1:])
 NB = len(EDGES) - 1
@@ -154,6 +155,16 @@ def group_pairs(key: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(i), np.concatenate(j)
 
 
+# Per-quasar pair sums in rest-frame lag bins
+#
+# Returns (quasar, band, bin, 6), last axis summed over pairs:
+#     0  pair count
+#     1  dm^2
+#     2  noise variance, plus residual plate variance if resid
+#     3  pairs with a plate epoch
+#     4  residual plate variance
+#     5  rest-frame lag, days
+# a comment, not a docstring: KERNELS source is hashed into the cache signatures
 def accumulate(nightly: pd.DataFrame, objids: np.ndarray, zmap: pd.Series,
                edges: np.ndarray = EDGES, plate_acc: np.ndarray | None = None,
                plate_pos: dict[int, int] | None = None,
@@ -218,6 +229,7 @@ SFMethod = Literal["object_mean", "object_median", "positive_median", "amplitude
 
 
 def object_second_moments(acc: np.ndarray) -> np.ndarray:
+    """Noise-subtracted SF^2 per quasar, in mag^2"""
     n = acc[..., 0]
     return np.divide(acc[..., 1] - acc[..., 2], n,
                      out=np.full_like(n, np.nan), where=n > 0)
@@ -251,6 +263,13 @@ def ensemble_second_moment(acc: np.ndarray, method: SFMethod = "object_mean",
 
 def object_bootstrap(acc: np.ndarray, n_boot: int = N_COV_BOOT, seed: int = 42,
                      weights: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Whole-quasar bootstrap
+
+    One resample covers all bands and bins, keeping their covariance
+    Returns
+        16/50/84th percentiles, (3, band, bin), mag^2
+        replicates, (n_boot, band, bin), mag^2
+    """
     rng = np.random.default_rng(seed)
     v = object_second_moments(acc)
     w = np.ones_like(v) if weights is None else np.broadcast_to(weights, v.shape)

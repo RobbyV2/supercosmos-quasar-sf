@@ -63,7 +63,8 @@ def star_inputs() -> pd.DataFrame:
                                                    dec=cat[2].to_numpy() * u.deg))
     cat = cat.iloc[idx].reset_index(drop=True)
     out = pd.DataFrame(dict(star=np.arange(len(pos)), ra=pos[:, 0], dec=pos[:, 1],
-                            match_arcsec=sep.arcsec, ebv_sfd=cat[6] / 2.751))
+                            match_arcsec=sep.arcsec, ebv_sfd=cat[6] / 2.751))  # column 6 is A_r
+    # recalibrated SFD scale, as for the quasars
     out["ebv"] = .86 * out.ebv_sfd
     good = (sep.arcsec <= 1.) & out.ebv.between(0., EBV[-1]).to_numpy()
     for i, band in enumerate("ugriz"):
@@ -85,6 +86,7 @@ def star_inputs() -> pd.DataFrame:
 
 
 def _weights(wave: np.ndarray, wf: np.ndarray, tf: np.ndarray) -> np.ndarray:
+    """abmag as a linear form: -2.5 log10(weights @ f_lambda) on wave"""
     lam = np.linspace(wf.min(), wf.max(), 8001)
     trans = np.interp(lam, wf, tf)
     step = (lam[-1] - lam[0]) / (len(lam) - 1)
@@ -98,6 +100,10 @@ def _weights(wave: np.ndarray, wf: np.ndarray, tf: np.ndarray) -> np.ndarray:
 
 
 def bj_response(power: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Adopted B_J response: SERC-J curve times (lambda / lambda_p)^power
+
+    lambda_p = sqrt(lambda_min lambda_max) of the curve; power defaults to BJ_RESPONSE_POWER
+    """
     w, t = al.read_bandpass(BANDS["bj"])
     return w, t * (w / np.sqrt(w.min() * w.max())) ** (BJ_RESPONSE_POWER if power is None else power)
 
@@ -162,6 +168,14 @@ def _at_ebv(mags: np.ndarray, ebv: np.ndarray, idx: np.ndarray) -> np.ndarray:
 
 def fit_stars(obs: np.ndarray, err: np.ndarray, ebv: np.ndarray, params: np.ndarray,
               mags: np.ndarray, candidates: int = 128) -> dict[str, np.ndarray]:
+    """Best grid spectrum per star on ugriz, at its own E(B-V)
+
+    Returns
+        chi2 and model index, free magnitude offset fitted out
+        delta: catalog g or r minus native Vega B_J, R, E, TechPan, best model
+        delta_err: spread of delta over models, weights exp(-chi2/2)
+        residual ugriz
+    """
     count = len(obs)
     result = dict(chi2=np.full(count, np.inf), model=np.zeros(count, int),
                   delta=np.zeros((count, 4)), delta_err=np.zeros((count, 4)),

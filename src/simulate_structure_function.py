@@ -22,6 +22,11 @@ ALL_BIN = {"drw": ("reduced_chi2_diag", "reduced_chi2_full", "final_sigma_param_
 
 
 def tk95(psd: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Random series with the given PSD, one per row
+
+    psd (m, nf), one-sided, at rfftfreq of the series length
+    Returns (m, 2 (nf - 1)), mean zero
+    """
     m, nf = psd.shape
     n = 2 * (nf - 1)
     amp = np.sqrt(0.25 * n * psd, dtype=np.float32)
@@ -38,6 +43,10 @@ def drw_psd(freq: np.ndarray, sfinf: np.ndarray, tau: np.ndarray) -> np.ndarray:
 
 
 def bending_psd(freq: np.ndarray, amp: np.ndarray, tau: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """pi tau A^2 / ((2 pi f tau)^alpha + (2 pi f tau)^2), zero at f = 0
+
+    alpha = 0 matches drw_psd at f > 0, with SF_inf = A sqrt(pi/2)
+    """
     u = 2.0 * np.pi * freq[None, 1:] * tau[:, None]
     s = np.zeros((len(tau), len(freq)), dtype=np.float32)
     s[:, 1:] = np.pi * tau[:, None] * amp[:, None] ** 2 / (u ** alpha[:, None] + u * u)
@@ -54,6 +63,12 @@ def simulate_mags(lc: pd.DataFrame, objids: np.ndarray, z: np.ndarray, sfinf: np
                   tau: np.ndarray, rng: np.random.Generator, base: pd.Series,
                   grid_n: int = GRID_N, add_noise: bool = True,
                   alpha: np.ndarray | None = None) -> np.ndarray:
+    """Simulated magnitude at every epoch of lc
+
+    sfinf, tau, alpha  (quasar, band); tau in rest-frame days
+    DRW PSD, bending PSD if alpha is given; sampled at whole days
+    Returns signal plus base level, plus magerr noise if add_noise
+    """
     oi = pd.Series(np.arange(len(objids)), index=objids)
     key = (oi.loc[lc["OBJID"]].to_numpy() * len(BANDS)
            + lc["band"].map({b: i for i, b in enumerate(BANDS)}).to_numpy())
@@ -78,6 +93,14 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
                          long_n: int = 1 << 19, shapes: bool = True,
                          on_noisy: Callable[..., None] | None = None,
                          redraw: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Recovery of known PSDs through the SF estimator on the fiducial cadences
+
+    drw: SF_inf (mag) and rest-frame tau (days), scalars or per band
+    redraw: new scattered DRW parameters each realization
+    Returns
+        summary per regime, PSD, grid, noise branch, band and bin
+        draws per realization
+    """
     from sf_model_checks import psd_grid
     lc = pd.read_parquet(_ROOT / LC_PARQUET, filters=[("band", "in", BANDS)])
     with np.load(_ROOT / "data/ensemble_sf_covariance.npz") as f:

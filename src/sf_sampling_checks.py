@@ -61,6 +61,7 @@ def finite_mean(value, axis=0):
 
 
 def asymmetry(moment):
+    """beta = (SF brightening - SF dimming) / SF total, over the sign axis"""
     sf = amplitude(moment)
     return (sf[..., 1, :] - sf[..., 2, :]) / sf[..., 0, :]
 
@@ -98,6 +99,7 @@ def build_cache(sample, n_draw):
             bins, dm, dm2, noise, kinds = pair_values(sub, zmap[oid])
             acc[qi, bi] = split_accumulator(bins, dm, dm2, noise, kinds)
             if (oid, band) in selected:
+                # one plate-CCD pair per bin, n_draw times
                 draws.append(draw_single_pairs(bins, dm2 - noise, kinds[2], rng, n_draw))
                 draw_keys.append((oid, band))
         np.savez_compressed(path, signature=token, ids=part, acc=acc,
@@ -112,6 +114,7 @@ def build_cache(sample, n_draw):
 
 
 def joint_test(point, reps, keep):
+    """Largest |beta| / SD over the kept bins, p-value from the centered replicates"""
     good = keep & np.isfinite(point) & np.all(np.isfinite(reps), axis=0)
     x, boot = point[good], reps[:, good]
     if not len(x):

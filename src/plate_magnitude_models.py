@@ -59,6 +59,13 @@ def native_robust_fit(A, y):
 
 
 def native_inverse(raw, xi, eta, p):
+    """Raw plate magnitude to native Vega magnitude
+
+    Returns
+        m, NaN outside the fitted range
+        d raw/dm at m
+        in-support mask
+    """
     c = np.array([p[f"c{k}"] for k in range(4)])
     count=int(p.spatial)
     names=FIELD_COLUMNS if FIELD_COLUMNS[0] in p else FIELD_NAMES
@@ -68,6 +75,7 @@ def native_inverse(raw, xi, eta, p):
     lo, hi = np.full(len(raw), p.mag_lo), np.full(len(raw), p.mag_hi)
     supported = (raw >= forward(lo)) & (raw <= forward(hi))
     supported &= (xi >= p.xi_lo) & (xi <= p.xi_hi) & (eta >= p.eta_lo) & (eta <= p.eta_hi)
+    # response is monotone, so bisection is safe
     for _ in range(45):
         mid = (lo+hi)/2
         faint = forward(mid) < raw
@@ -79,6 +87,7 @@ def native_inverse(raw, xi, eta, p):
 
 
 def star_fold(star):
+    # same fold for a star on every plate
     return np.asarray(star, np.int64) * 2654435761 % 5
 
 
@@ -124,6 +133,7 @@ def native_calibration():
     stars, det = native_inputs()
     coefficients, validation, held, coverage = [], [], [], []
     folds = star_fold(stars.index)
+    # fold 4 held out for validation
     eligible = stars.fit_ok.to_numpy(bool) & (folds != 4)
     centers = al.plate_centers()
     for plate, d in det.groupby("plate", sort=True):
@@ -144,6 +154,7 @@ def native_calibration():
         rate = np.divide(seen,total,out=np.zeros(len(total),float),where=total>0)
         reliable = total >= 100
         peak = np.max(rate[reliable]) if reliable.any() else 0
+        # fainter than this, mostly stars scattered bright get detected
         complete = reliable & (rate >= .95*min(peak,1.))
         groups = np.split(np.flatnonzero(complete), np.flatnonzero(np.diff(np.flatnonzero(complete))>1)+1)
         groups = [g for g in groups if len(g)>=6]

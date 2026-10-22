@@ -59,6 +59,14 @@ def bin_lag(a, lag):
 
 
 def samples():
+    """Fiducial sample, median-split groups and tercile grid cells, per band
+
+    Yields
+        band, sample name
+        pair sums (quasar, bin, 3): pairs, dm^2, noise plus residual variance
+        properties: LOGMBH, LOGLEDD_RATIO, z
+        mean pair lag (quasar, bin), rest-frame days
+    """
     with np.load(OUT/'ensemble_sf_covariance.npz') as f:
         boot = {k:f[k] for k in f.files}
     with np.load(OUT/'structure_function_sampling_covariance.npz') as f:
@@ -110,6 +118,15 @@ def covariance(reps):
 
 
 def all_bin_fits(a, grid, reps, lag):
+    """DRW and free-slope PSD fits to every bin with SF > 0, at each bin's mean pair lag
+
+    a     pair sums (quasar, bin, slots), slots 0-2 as in accumulate
+    reps  bootstrap SF replicates (n_boot, bin), mag
+    lag   mean pair lag (quasar, bin), rest-frame days
+    Returns
+        fit rows, drw then bending_psd
+        residual rows per model and bin
+    """
     sf = np.sqrt(np.maximum(esf.object_second_moments(a).mean(axis=0),0))
     use = sf > 0
     dt,y,n = fsf.CENTERS[:len(sf)][use],sf[use],int(use.sum())
@@ -156,6 +173,7 @@ def all_bin_fits(a, grid, reps, lag):
             tau_boundary=tau < 10.01 or tau > 99990)
         if not free:
             R = np.eye(n)-J@A
+            # parameter term scaled by max(reduced chi2, 1)
             cr = R@C@R.T+(max(x2/(n-k),1.)-1)*J@P@J.T
             x = float(r[long]@np.linalg.solve(cr[np.ix_(long,long)],r[long]))
             pl = chi2.sf(x,long.sum())
@@ -395,6 +413,13 @@ def fiducial_nightly():
 
 
 def replace_plate_epochs(n, rng, variant):
+    """Plate magnitudes replaced by CCD-era values of the same quasar
+
+    ccd_night   random CCD night
+    ccd_survey  random CCD night, each survey equally likely
+    ccd_median  CCD nightly median
+    Gaussian noise brings each to the plate noise plus residual plate variance
+    """
     sss, m, s2, fv, survey = n.sss.to_numpy(bool), n.mag.to_numpy(), n.sig.to_numpy()**2, n.fv0.to_numpy(), n.survey.to_numpy()
     out = m.copy()
     for rows in n.groupby('OBJID', sort=False).indices.values():
