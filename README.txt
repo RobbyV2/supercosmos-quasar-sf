@@ -2,6 +2,7 @@ Quasar ensemble structure functions over a 72-year baseline: SuperCOSMOS plates 
 python3.12 -m venv .venv && py=.venv/bin/python && $py -m pip install -r requirements.txt
 included  data/: SDSS, SERC, POSS-I passbands; CALSPEC Vega; Vanden Berk composite; Roma-BZCAT; BOSZ and SDSS spectrum manifests; SuperCOSMOS wu_qso.hdf5, survey_table.fits; IRSA ZTF exposure metadata (ztf.ztf_current_meta_sci)
 included  data/plate_quasar_epochs.csv: 25537 calibrated plate epochs, SDSS g/r system, DR16Q quasars less Roma-BZCAT blazars; sdss_name ra dec band mjd mag magerr plate survey fiducial_g fiducial_r
+included  data/plate_native_pair_variance.csv: 91 signed residual calibration variances (mag^2) by native pair class and 0.5 mag bin, subtracted per pair by floor_variance in src/ensemble_structure_function.py; native_a native_b band mag_lo mag_hi subset boundary_sigma_min n_pairs n_core n_stars class_id clip_center clip_limit residual_variance null_mean unclipped_null_mean null_star_mean training_floor_se null_star_se
 supply    data/S82/{Catalog,dr16s82_sdssLCRaw,dr16s82_ps1LCRaw,dr16s82_ZuberLCRaw}.parquet (catalog, CCD light curves); data/StandardStars.zip, unzip -d temp (CCD standard stars); not included
 hosted    data/roe_stars.hdf5 (780.0 MB), host TBD
 fetch     curl -L http://quasar.astro.illinois.edu/paper_data/DR16Q/dr16q_prop_May01_2024.fits.gz | gunzip > data/dr16q_prop_May01_2024.fits
