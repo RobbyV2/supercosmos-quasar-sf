@@ -13,9 +13,11 @@ from ensemble_structure_function import BANDS, EDGES, CENTERS, NB, LC_PARQUET, c
 from assemble_lightcurves import redshifts
 
 _ROOT = Path(__file__).resolve().parents[1]
+# 2^19 days (1,435 yr) to include red-noise leakage (Uttley et al. 2002)
 GRID_N = 1 << 19
 BATCH = 64
 SEED = 20260818
+# fit statistics compared between the DRW null and the data
 ALL_BIN = {"drw": ("reduced_chi2_diag", "reduced_chi2_full", "final_sigma_param_scaled", "long_chi2_param_scaled",
                    "long_sigma_param_scaled"),
            "bending_psd": ("alpha", "vs_drw_delta_chi2", "vs_drw_sigma", "vs_drw_f_sigma")}
@@ -32,12 +34,14 @@ def tk95(psd: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     amp = np.sqrt(0.25 * n * psd, dtype=np.float32)
     f = (rng.standard_normal((m, nf), dtype=np.float32)
          + 1j * rng.standard_normal((m, nf), dtype=np.float32)) * amp
+    # zero-mean series, real Nyquist term (sqrt(2) keeps its power)
     f[:, 0] = 0.0
     f[:, -1] = f[:, -1].real * np.sqrt(2.0)
     return np.fft.irfft(f, n, axis=1)
 
 
 def drw_psd(freq: np.ndarray, sfinf: np.ndarray, tau: np.ndarray) -> np.ndarray:
+    # DRW power spectrum, known input SF
     w = (2.0 * np.pi * freq[None, :] * tau[:, None]) ** 2
     return (2.0 * sfinf[:, None] ** 2 * tau[:, None] / (1.0 + w)).astype(np.float32)
 
@@ -69,6 +73,7 @@ def simulate_mags(lc: pd.DataFrame, objids: np.ndarray, z: np.ndarray, sfinf: np
     DRW PSD, bending PSD if alpha is given; sampled at whole days
     Returns signal plus base level, plus magerr noise if add_noise
     """
+    # one Timmer & Koenig 1995 light curve per quasar and band, at its epochs
     oi = pd.Series(np.arange(len(objids)), index=objids)
     key = (oi.loc[lc["OBJID"]].to_numpy() * len(BANDS)
            + lc["band"].map({b: i for i, b in enumerate(BANDS)}).to_numpy())
@@ -82,6 +87,7 @@ def simulate_mags(lc: pd.DataFrame, objids: np.ndarray, z: np.ndarray, sfinf: np
     for a in range(0, len(ks), BATCH):
         sl = slice(a, a + BATCH)
         oo, bb = ks[sl] // len(BANDS), ks[sl] % len(BANDS)
+        # tau stretched by 1 + z (observed-day grid)
         s, t = sfinf[oo, bb].astype(np.float32), (tau[oo, bb] * (1.0 + z[oo])).astype(np.float32)
         x = tk95(drw_psd(freq, s, t) if alpha is None else bending_psd(freq, s, t, alpha[oo, bb]), rng)
         for q, (f0, c) in enumerate(zip(first[sl], cnt[sl])):
@@ -103,6 +109,7 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
     """
     from sf_model_checks import psd_grid
     lc = pd.read_parquet(_ROOT / LC_PARQUET, filters=[("band", "in", BANDS)])
+    # fiducial quasars and bins (the data's cadence)
     with np.load(_ROOT / "data/ensemble_sf_covariance.npz") as f:
         selected = {b: np.sort(f[f"objids_{b}"].astype(str)) for b in BANDS}
         nbands = {b: f[f"lag_counts_{b}"].shape[1] for b in BANDS}
@@ -116,6 +123,7 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
     objids = np.array(sorted(nightly.OBJID.unique()))
     z = zmap.reindex(objids).to_numpy()
     oi = {o: i for i, o in enumerate(objids)}
+    # pairs and lag bins built once (cadence only)
     descriptors = []
     for (o, b), sub in nightly.groupby(["OBJID", "band"], sort=False, observed=True):
         ii, jj = np.triu_indices(len(sub), 1)
@@ -127,21 +135,25 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
         descriptors.append((oi[o], BANDS.index(b), sub.index.to_numpy(),
                             ii[keep].astype(np.int32), jj[keep].astype(np.int32),
                             bins[keep].astype(np.int8), days[keep]))
+    # whole nights on the daily grid, nightly errors as noise
     sim_lc = nightly.drop(columns="time").rename(columns={"night": "time", "sig": "magerr"})
     base = pd.Series(0.0, index=pd.MultiIndex.from_frame(nightly[["OBJID", "band"]].drop_duplicates()))
     zero = np.zeros((len(objids), len(BANDS), NB, 3))
     sig = nightly.sig.to_numpy()
     rank = np.argsort(np.argsort(nightly.groupby("OBJID").size().reindex(objids).to_numpy()))
+    # DRW parameters scattered between quasars (a mix flattens more gradually)
     pop = lambda g: (np.clip(g.normal(0, 0.2, len(objids)), -0.5, 0.5),
                      np.clip(g.normal(0, 0.35, len(objids)), -0.8, 0.8))
     fixed = pop(rng)
     flat = np.zeros(len(objids))
     per = lambda d, v: np.outer(10 ** d, np.broadcast_to(v, len(BANDS)))
     spread = lambda da, dtau, a=drw[0], t=drw[1]: (per(da, a), per(dtau, t))
+    # cadence_correlated, largest SF_inf on the most-sampled quasars (tests equal weights)
     mixes = {"heterogeneous": lambda d: spread(*d),
              "cadence_correlated": lambda d: spread(np.sort(d[0])[rank], d[1])}
     regimes = [("identical", "drw", grid_n, spread(flat, flat), None)] + [
         (k, "drw", grid_n, (lambda g, f=f: f(pop(g))) if redraw else f(fixed), None) for k, f in mixes.items()]
+    # rising SFs (fitted bending PSD, f^-2 from the 422 d SF) on both grids
     if shapes:
         bend = all_bin("bending_psd")
         start = (pd.read_csv(_ROOT / "data/structure_function_fixed_population.csv")
@@ -154,6 +166,8 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
     rows, draws = [], []
     started = time.monotonic()
 
+    # input SF^2 averaged over the data's pairs and quasars, as measured
+    # grid truth, exact periodic-series SF^2 (below the continuous SF at long lags)
     def truths(amp, tau, alpha, frequency, n):
         truth, grid_truth = zero.copy(), zero.copy()
         for o, bi, _, ii, jj, bins, days in descriptors:
@@ -173,7 +187,9 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
         frequency = np.fft.rfftfreq(n, 1.0)
         case_draws, coverage, inputs = [], [], []
         for realization in range(n_real):
+            # seed per case and realization (new cases keep earlier draws)
             gen = np.random.default_rng(SEED + 1000 * case + realization)
+            # redrawn populations get new inputs each realization (target = population mean)
             if callable(params) or not inputs:
                 amp, tau = params(gen) if callable(params) else params
                 inputs.append(truths(amp, tau, alpha, frequency, n))
@@ -183,6 +199,7 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
             noisy = intrinsic + gen.normal(0, sig)
             for noise, magnitudes, variance in [("noiseless", intrinsic, np.zeros_like(sig)),
                                                 ("observed_noise", noisy, sig ** 2)]:
+                # pair sums as in esf.accumulate
                 acc = zero.copy()
                 for o, bi, positions, ii, jj, bins, _ in descriptors:
                     pi, pj = positions[ii], positions[jj]
@@ -197,6 +214,7 @@ def aggregation_recovery(drw: tuple[float | pd.Series, float | pd.Series], n_rea
                         case_draws.append(dict(regime=regime, psd=psd, grid_days=n, noise=noise, band=b,
                                                realization=realization, bin=k, sf2_mag2=sf2[bi, k],
                                                sf_mag=np.sqrt(max(sf2[bi, k], 0.0))))
+                # coverage of the quasar-bootstrap 16-84% interval (tests the 1 sigma errors)
                 if noise == "observed_noise":
                     for bi, b in enumerate(BANDS):
                         keep = np.isin(objids, selected[b])
@@ -247,6 +265,7 @@ def drw_excess_null(n_real: int = 64) -> pd.DataFrame:
     rows = []
     started = time.monotonic()
 
+    # each realization fitted as the data (adopted bootstrap plan, mean pair lags)
     def on_noisy(regime, realization, acc, objids):
         new = []
         for bi, b in enumerate(BANDS):
@@ -262,10 +281,12 @@ def drw_excess_null(n_real: int = 64) -> pd.DataFrame:
               + " ".join(f"{r['band']} {r['drw_long_sigma_param_scaled']:.2f}" for r in new)
               + f", elapsed {time.monotonic() - started:.0f} s", flush=True)
 
+    # DRW null at each band's fitted parameters
     fit = all_bin("drw")
     aggregation_recovery((fit.sf_inf_mag, fit.tau_days), n_real, shapes=False, on_noisy=on_noisy)
     d = pd.DataFrame(rows)
     by = d.groupby(["regime", "band"], sort=False)[cols]
+    # empirical p-value, realizations at or above the measurement (joint, both bands)
     hit = d[cols].ge(measured.loc[d.band].to_numpy())
     both = hit.groupby([d.regime, d.realization], sort=False).all().groupby(level=0, sort=False).sum()
     k = pd.concat([hit.groupby([d.regime, d.band], sort=False).sum(),

@@ -13,6 +13,7 @@ FID = {"g": 1, "r": 2, "i": 3}
 SDSS_P3_MJD = 53500.0
 MIN_EPOCHS = 10
 
+# file and columns per survey (_p3 adds the Yu et al. 2025 extra scatter)
 QSO_SPECS = {"sdss": ("dr16s82_sdssLCRaw", "psMag", "psMagErr", "psMagErr_p3", "mjd"),
              "ps1": ("dr16s82_ps1LCRaw", "psfMag", "psfMagErr", "psfMagErr_p3", "obsTime"),
              "ztf": ("dr16s82_ZuberLCRaw", "mag", "magerr", "magerr_p3", "mjd")}
@@ -30,6 +31,7 @@ def excess_curves() -> dict[tuple[str, str], tuple[np.ndarray, np.ndarray]]:
             d = d[d[tc] >= SDSS_P3_MJD]
         for b in BANDS:
             s = d[d["filterID"] == FID[b]]
+            # extra scatter vs magnitude from _p3 and raw errors, for the stars
             ex = np.sqrt(np.clip(s[pc].to_numpy() ** 2 - s[rc].to_numpy() ** 2, 0.0, None))
             m = s[mc].to_numpy()
             ok = np.isfinite(m) & np.isfinite(ex)
@@ -37,6 +39,7 @@ def excess_curves() -> dict[tuple[str, str], tuple[np.ndarray, np.ndarray]]:
             med = pd.Series(ex[ok]).groupby(grid).median()
             med = med[med.index.to_series().between(14.0, 26.0)]
             curves[(sv, b)] = (med.index.to_numpy(dtype=float), med.to_numpy())
+            # single curve valid if the excess depends on magnitude alone (5 mmag, 14-22 mag)
             inr = ok & (m >= 14.0) & (m <= 22.0)
             chk = np.interp(m[inr][:5000], *curves[(sv, b)])
             if np.abs(chk - ex[inr][:5000]).max() > 0.005:
@@ -75,6 +78,7 @@ def load_star_lcs(curves: dict) -> pd.DataFrame:
             "OBJID": "s" + s["ssID"].astype(str), "survey": "ps1", "band": b,
             "time": s["obsTime"].to_numpy(), "mag": s["psfMag"].to_numpy(),
             "err_raw": s["psfMagErr"].to_numpy()}))
+    # z prefix (ZTF objectids differ from ssIDs), maglimit for the shallow-epoch cut
     for b in BANDS:
         s = pd.read_parquet(SS / f"ss_ZuberLC_{b}_clean.parquet",
                             columns=["objectid", "mjd", "mag", "magerr", "fieldid", "rcidin", "objra"]).assign(band=b)
@@ -99,6 +103,7 @@ def star_stats(lc: pd.DataFrame) -> pd.DataFrame:
     g = lc.groupby(["survey", "band", "OBJID"], observed=True)
     st = g.agg(n=("mag", "size"), medmag=("mag", "median"))
     st = st[st["n"] >= MIN_EPOCHS]
+    # scatter about each star's median measures the photometric error (stars don't vary)
     df = lc.merge(st, left_on=["survey", "band", "OBJID"], right_index=True)
     r = df["mag"] - df["medmag"]
     df["absr"] = r.abs()
@@ -110,6 +115,7 @@ def star_stats(lc: pd.DataFrame) -> pd.DataFrame:
     out = g2.agg(n=("mag", "size"), medmag=("medmag", "first"), mad=("absr", "median"),
                  r2m=("r2", "mean"), raw2=("raw2", "mean"), used2=("used2", "mean"),
                  chi2=("chi2", "mean")).reset_index()
+    # robust and SD scatter, reduced chi2 near 1 if err_used fits
     out["sig_rob"] = 1.4826 * out["mad"]
     out["sig_std"] = np.sqrt(out["r2m"] * out["n"] / (out["n"] - 1))
     out["chi2_dof"] = out["chi2"] * out["n"] / (out["n"] - 1)

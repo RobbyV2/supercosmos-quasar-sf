@@ -81,11 +81,13 @@ def sdss_epochs() -> tuple[pd.Index, pd.DataFrame]:
    # 17 columns: MJD, mag, err for each of ugriz, then RA, Dec
    a = np.array(b"".join(f for _, f in files).split(), dtype=float).reshape(-1, 17)
    dbid = np.repeat([n for n, _ in files], [f.count(b"\n") for _, f in files])
+   # MacLeod et al. 2012 light curves, matched to the catalog by position
    _, first = np.unique(dbid, return_index=True)
    ids = match_groups_to_catalog(pd.DataFrame({"GROUP_ID": dbid[first], "RA": a[first, 15] % 360, "DEC": a[first, 16]}),
                                  _ROOT / "data/S82/Catalog.parquet").set_index("GROUP_ID").OBJID
    lc = pd.concat([pd.DataFrame({"objectId": ids.reindex(dbid).to_numpy(), "band": b, "time": a[:, 3 * k],
                                  "mag": a[:, 3 * k + 1], "magerr": a[:, 3 * k + 2]}) for k, b in enumerate(bands_sdss)])
+   # drop null placeholders and unmatched light curves
    ok = lc.objectId.notna() & (lc.mag > 0) & (lc.mag < 90) & (lc.magerr < 99) & (lc.time > 1)
    return pd.Index(ids), lc[ok].reset_index(drop=True)
 
@@ -122,6 +124,7 @@ def concat_light_curves_df(
    cat_keys = cat.reset_index(drop=False).copy()
    cat_keys["ps1objID"] = cat_keys["ps1objID"].astype("Int64")
 
+   # shift PS1 and PS1-tied ZTF onto SDSS by qsogen color (Temple et al. 2021)
    offset_wide = pd.DataFrame(
        {
            "objectId": cat_keys["objectId"].values,
@@ -157,6 +160,7 @@ def concat_light_curves_df(
        ztf.merge(cat_keys.loc[:, ["ps1objID", "objectId"]], on="ps1objID", how="inner")
        .merge(band_map, on="filterID", how="inner")
    )
+   # depth cut in raw ZTF mags (Arevalo et al. 2023)
    ztf_df = (ztf_df.assign(maglimit=ztf_maglimit(ztf_df))
              .loc[:, ["objectId", "band", "mjd", "mag", "magerr_p3", "maglimit"]]
              .rename(columns={"mjd": "time", "magerr_p3": "magerr"}))
@@ -165,6 +169,7 @@ def concat_light_curves_df(
                                       ztf_df["mag"].to_numpy(), ztf_df["maglimit"].to_numpy())
    ztf_df = ztf_df.drop(columns="maglimit")
 
+   # epochs without an SDSS offset become NaN and are dropped
    ps1_df = ps1_df.merge(offset_long, on=["objectId", "band"], how="left")
    ztf_df = ztf_df.merge(offset_long, on=["objectId", "band"], how="left")
    ps1_df["mag"] = ps1_df["mag"] + ps1_df["offset"]
@@ -274,6 +279,7 @@ def assign_group_ids_by_sky(df: pd.DataFrame, radius_arcsec: float = 1.0) -> pd.
                      dec=out["DEC"].to_numpy() * u.deg,
                      frame="icrs")
 
+   # chain detections within the radius (positions scatter between plates)
    i1, i2, _, _ = coords.search_around_sky(coords, seplimit=radius_arcsec * u.arcsec)
    uf = _UnionFind(len(out))
    for a, b in zip(i1, i2):
@@ -297,6 +303,7 @@ def drop_blended_parents(df: pd.DataFrame) -> pd.DataFrame:
    return out.drop(columns=["_parent", "_sep"]).sort_index()
 
 
+# saturation limits per plate band, R1 for POSS-I
 SATURATION_LIMITS = {"B_J": 16.0, "R": 14.5, "R1": 15.0, "I": 14.0}
 
 
@@ -346,6 +353,7 @@ _SSS_CODE_BI = {1: 0, 2: 1, 3: 2, 9: 1}
 _SSS_BI_BAND = {0: "B_J", 1: "R", 2: "I"}
 
 def load_star_detections() -> pd.DataFrame:
+   # star ID = file order, as in star_sky_positions
    parts, stars = [], []
    with h5py.File(_ROOT / "data/roe_stars.hdf5") as f:
        for i, k in enumerate(f.keys()):
@@ -365,6 +373,7 @@ def load_star_detections() -> pd.DataFrame:
        pid = np.asarray(t["PLATEID"]).ravel().astype(np.int64)
        mjd = np.asarray(t["MJD"]).ravel().astype(float)
        sname = np.asarray(t["SURVEYNAME"]).ravel().astype(str)
+   # epoch and survey from the plate table
    order = np.argsort(pid)
    pos = np.searchsorted(pid, plate, sorter=order)
    if not np.array_equal(pid[order][pos], plate):
@@ -430,15 +439,19 @@ def field_coords(plate: np.ndarray, ra: np.ndarray, dec: np.ndarray,
 TRUNC_U_MIN = -2.0
 
 CCD_TRUNC_CSV = _ROOT / "data/ccd_truncation_correction.csv"
+# CCD truncation bias per 0.25 mag bin, complete brighter than CCD_BRIGHT
 CCD_BINS = np.arange(17.0, 23.51, 0.25)
 CCD_MIN_OBJ = 60
 CCD_BRIGHT = 19.5
 CCD_BANDS = ["g", "r", "i", "z"]
+# detected fraction below this fails calib_ok
 CCD_MIN_FRAC = 0.2
 # held-out test unbiased to here; beyond, g over-corrects (+0.072 mag at 22.6, +0.120 at 23.1)
 CCD_VALID_MAX = 22.4
 ZTF_META = _ROOT / "data/ztf/ztf_current_meta_sci.csv.gz"
+# ZTF epochs of sources fainter than this dropped (Arevalo et al. 2023)
 ZTF_FAINT = 20.0
+# drops PS1 mags of bad exposures and over-extrapolated high-z offsets
 PS1_MAG_RANGE = (10.0, 25.0)
 PALOMAR = EarthLocation.from_geodetic(-116.863 * u.deg, 33.356 * u.deg, 1706 * u.m)
 
@@ -450,6 +463,7 @@ def ztf_maglimit(z: pd.DataFrame) -> np.ndarray:
                      "t0": m.obsjd - 2400000.5, "maglimit": m.maglimit})
    if m.duplicated(["fieldid", "rcidin", "band", "t0"]).any():
        raise ValueError("duplicate ZTF exposure metadata")
+   # heliocentric mid-exposure MJD to UTC exposure start, as in the metadata
    node = pd.DataFrame({"t": np.round(z["mjd"].to_numpy() * 8) / 8, "ra": np.round(z["objra"].to_numpy() * 2) / 2})
    nodes = node.drop_duplicates()
    nodes["ltt"] = Time(nodes.t.to_numpy(), format="mjd", scale="utc", location=PALOMAR).light_travel_time(
@@ -457,6 +471,7 @@ def ztf_maglimit(z: pd.DataFrame) -> np.ndarray:
    q = pd.DataFrame({"fieldid": z["fieldid"].to_numpy(np.int64), "rcidin": z["rcidin"].to_numpy(np.int64),
                      "band": z["band"].to_numpy(str), "i": np.arange(len(z)),
                      "t": z["mjd"].to_numpy() - node.merge(nodes, how="left").ltt.to_numpy() - 15 / 86400})
+   # limiting mag of the nearest exposure within 120 s
    j = pd.merge_asof(q.sort_values("t"), m.sort_values("t0"), left_on="t", right_on="t0",
                      by=["fieldid", "rcidin", "band"], direction="nearest", tolerance=120 / 86400)
    return j.sort_values("i").maglimit.to_numpy()
@@ -493,6 +508,7 @@ def ccd_reference_mags() -> pd.Series:
    sd = (raw["psMag"].astype(float).groupby([raw["objectId"].astype(str).rename("OBJID"),
                                              raw["filterID"].map({filters[b]: b for b in bands_sdss}).rename("band")])
          .median().rename("ref"))
+   # tie qsogen to raw SDSS medians of bright, untruncated quasars
    z0 = float(np.nanmedian((sd - qg).dropna()[qg.reindex(sd.index) < CCD_BRIGHT]))
    return (qg + z0).combine_first(sd)
 
@@ -509,6 +525,7 @@ def build_ccd_truncation(df_base: pd.DataFrame, ref: pd.Series,
    for (sv, b), g in d.groupby(["survey", "band"], sort=True):
        if len(g) < 10 * CCD_MIN_OBJ:
            continue
+       # zero point from bright, complete quasars
        z0 = float(np.median((g["med"] - g["ref"])[g["ref"] < CCD_BRIGHT]))
        t = g.assign(o=g["med"] - g["ref"] - z0).groupby("node").agg(
            o=("o", "median"), k=("n", "mean"), N=("o", "size"))
@@ -516,12 +533,16 @@ def build_ccd_truncation(df_base: pd.DataFrame, ref: pd.Series,
        x = CCD_BINS[t.index.to_numpy()] + 0.125
        # truncation offset one-sided and monotone: PAVA
        o = np.minimum(_pava_decreasing(t["o"].to_numpy(), t["N"].to_numpy()), 0.0)
+       # detected fraction, epoch counts relative to bright quasars
        f = t["k"].to_numpy() / max(t["k"].to_numpy()[x < CCD_BRIGHT].max(), 1e-9)
+       # smooth detection limit for the variance loss below
        lim, sig = _ccd_det_fit(x, f, t["N"].to_numpy())
+       # truncated Gaussian at the limit (mean biased bright, scatter low)
        u = np.maximum((lim - x) / sig, TRUNC_U_MIN)
        lam = np.exp(norm.logpdf(u) - norm.logcdf(u))
        # k: source share of selection variance (from offset) = share of second moment lost
        k = np.clip(np.where(lam > 1e-6, -o / (sig * np.maximum(lam, 1e-6)), 0.0), 0.0, 1.0)
+       # variance share kept by surviving epochs, rescales pair moments downstream
        v = np.clip(1.0 - k * (u * lam + lam ** 2), 1e-2, 1.0)
        rows.append(pd.DataFrame(dict(survey=sv, band=b, ref_mag=x, n_objects=t["N"].to_numpy(),
                                      zero=z0, offset_mag=o, det_frac=np.minimum(f, 1.0),
@@ -584,6 +605,7 @@ def apply_ccd_truncation(df_base: pd.DataFrame, curve: pd.DataFrame,
              f"{np.percentile(off[m], 95):+.4f}, median V {np.median(v[m]):.3f}, "
              f"{float(np.mean(off[m] < -0.05)):.4f} beyond 0.05 mag, "
              f"{float(np.mean(fr[m] < 0.5)):.4f} below half completeness")
+   # undo bright bias from faint CCD epochs lost below the limit
    df["mag"] = df["mag"].to_numpy(float) - off
    df["trunc_v"] = v
    # flagged below CCD_MIN_FRAC or past CCD_VALID_MAX; calibok drops them
@@ -650,10 +672,12 @@ def main() -> None:
    print(f"ps1 epochs outside {PS1_MAG_RANGE} mag dropped: {int(bad.sum())}")
    df_base = df_base[~bad]
 
+   # plate epochs inside the calibration and error-curve ranges
    df_sss = native_longform()
 
    df_total = assemble_total_lightcurve(df_base, df_sss)
 
+   # check no plate epochs were lost
    n_possi = int((df_total["survey"] == "sss_possi").sum())
    native = pd.read_parquet(_ROOT / "data/plate_native_quasar_epochs.parquet", columns=["SURVEYNAME", "supported"])
    if n_possi != int((native.SURVEYNAME.eq("POSSI-E(S)") & native.supported).sum()):

@@ -43,11 +43,13 @@ def _native_sed_row(args):
     spectra = [(wr * (1 + z), fr / (1 + z)), (model.wavred, model.flux)]
     terms = []
     for w, f in spectra:
+        # Milky Way reddening in the observed frame, air wavelengths as the passbands
         use = (w >= 2000) & (w <= 33000)
         w, f = w[use], f[use]
         f = redden(w, f, foreground)
         w = vac_to_air(w)
         mags = {b: abmag(w, f, *bp) for b, bp in bands.items()}
+        # native Vega to catalog g or r (r 0.015 mag off AB)
         terms.append([mags["g" if b == "bj" else "r_sdss"] - mags[b] + vega[b]
                       - (0 if b == "bj" else .015) for b in ("bj", "r", "e", "tp")])
     return [dict(OBJID=obj, native=b, z=z, ebv=foreground, composite=terms[0][j],
@@ -58,6 +60,7 @@ def _native_sed_row(args):
 def _native_control_bands():
     from stellar_sed_calibration import bj_response
 
+    # the calibration's own responses (only the quasar spectrum differs)
     bands = dict(bj=bj_response(), **{b: read_bandpass(f) for b, f in dict(r="iiiaf_og590.txt",
                  e="possi-e.txt", tp="techpan_og590.txt", g="SLOAN_SDSS.g.dat", r_sdss="SLOAN_SDSS.r.dat").items()})
     vega = {b: ab_minus_vega(*bands[b]) for b in ("bj", "r", "e", "tp")}
@@ -65,12 +68,14 @@ def _native_control_bands():
 
 
 def native_sed_control():
+    # each quasar's own qsogen SED (Temple et al. 2021) against the composite term
     epochs = pd.read_parquet(_ROOT / "data/plate_native_quasar_epochs.parquet", columns=["OBJID", "z"])
     objects = epochs.drop_duplicates("OBJID").set_index("OBJID")
     objects.index = objects.index.astype(str)
     cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet").assign(
         OBJID=lambda d: d.objectId.astype(str)).set_index("OBJID")
     objects = objects.join(cat[["qg_LogL3000", "qg_ebv", "qg_fragal", "ebv"]]).dropna()
+    # E(B-V) times 0.86 (Schlafly & Finkbeiner 2011), as for the standard stars
     objects["ebv"] *= .86
     bands, vega = _native_control_bands()
     composite = Table.read(_ROOT / "data/vandenberk_qso_composite_cds.txt", format="ascii.cds")
@@ -91,6 +96,7 @@ def observed_sed_control(manifest_path=None, output=None):
 
     root = _ROOT / "data/sdss_sed_control"
     manifest = pd.read_csv(manifest_path or root / "manifest.csv", dtype={"OBJID": str})
+    # public manifest lacks OBJID, join the catalog on plate, MJD, fiber
     if "OBJID" not in manifest:
         keys = ["PLATE", "MJD", "FIBERID"]
         cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet", columns=[
@@ -103,6 +109,7 @@ def observed_sed_control(manifest_path=None, output=None):
     for p in manifest.itertuples(index=False):
         with fits.open(root / p.file) as h:
             d, info = h[1].data, h[2].data
+            # flux in erg/s/cm^2/A
             w, f, iv = 10. ** np.array(d["loglam"], float), np.array(d["flux"], float) * 1e-17, np.array(d["ivar"], float) / 1e-34
             warning = int(info["ZWARNING"][0])
             metadata = {key.lower(): info[key][0].item() if hasattr(info[key][0], 'item') else str(info[key][0])
@@ -111,6 +118,7 @@ def observed_sed_control(manifest_path=None, output=None):
                         if key in info.names}
         w = vac_to_air(w)
         good = np.isfinite(f) & np.isfinite(iv) & (iv > 0)
+        # interpolate over masked pixels (much masked weight or a long gap fails)
         flux = np.interp(w, w[good], f[good])
         variance = np.divide(1, iv, out=np.zeros(len(iv)), where=good)
         for native in ("bj", "r", "e", "tp"):
@@ -121,12 +129,14 @@ def observed_sed_control(manifest_path=None, output=None):
                        zwarning=warning, full_coverage=covered, quality=False, **metadata)
             if covered:
                 weights = np.array([_weights(w, *bp) for bp in curves])
+                # same photon-weighted integral as abmag
                 integrals = weights @ flux
                 missing = np.max(weights[:, ~good].sum(axis=1) / weights.sum(axis=1))
                 bad = np.flatnonzero((weights.sum(axis=0) > 0) & ~good)
                 groups = np.split(bad, np.flatnonzero(np.diff(bad) > 1) + 1)
                 gap = max([w[g[-1]] - w[g[0]] for g in groups if len(g)] + [0.])
                 delta = -2.5 * np.log10(integrals[0] / integrals[1]) + vega[native] - (0 if native == "bj" else .015)
+                # formal ivar error for the 0.03 mag cut (no flux-calibration error)
                 jac = 2.5 / np.log(10) * (weights[1] / integrals[1] - weights[0] / integrals[0])
                 error = np.sqrt(np.sum(jac ** 2 * variance))
                 compared = control.loc[p.OBJID, native]

@@ -14,6 +14,7 @@ import fit_structure_function as fsf
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'data'
+# log10(dt/tau) grid, low-frequency alpha < 2 (high-frequency slope fixed at 2)
 LOGX = np.linspace(-6, 6, 481)
 SLOPE_ALPHA = np.round(np.arange(-0.5, 2.901, 0.05), 8)
 ALPHA = SLOPE_ALPHA[SLOPE_ALPHA < 2]
@@ -26,6 +27,7 @@ def psd_sf2(x, alpha, beta):
     d = lambda v: 1/(s*v**(alpha-m)+v**(beta-m))
     w = lambda v: d(v)/v**m
     q = lambda f, lo, hi, **kw: quad(f, lo, hi, epsabs=0, epsrel=1e-9, limit=1000, **kw)[0]
+    # split at the bend v = x and at v = 1, cosine rule for the tail
     low = q(lambda v: .5*np.sinc(v/2/np.pi)**2*d(v), 0, min(x, 1.), weight='alg', wvar=(2-m, 0))
     low += q(lambda v: 2*np.sin(v/2)**2*w(v), x, 1) if x < 1 else q(w, 1, k)-q(w, 1, k, weight='cos', wvar=1.)
     tail = q(w, k, np.inf)
@@ -73,6 +75,7 @@ def samples():
         object_data = {k:f[k] for k in f.files if k.startswith('fiducial_ids_') or k.startswith('fiducial_acc_')}
     all_ids = np.unique(np.concatenate([boot[f'objids_{b}'].astype(str) for b in esf.BANDS]))
     prop = esf.load_properties(all_ids).reindex(all_ids)
+    # median splits over both bands combined (shared g and r boundaries)
     med = {c:np.quantile(prop[c].dropna(), [0,.5,1]) for c in ['LOGMBH','LOGLEDD_RATIO']}
     thirds = {c:np.quantile(prop[c].dropna(), np.linspace(0,1,4)) for c in med}
     catalog = pd.read_parquet(OUT/'plate_completeness_sample.parquet')
@@ -89,6 +92,7 @@ def samples():
         p = prop.reindex(oid).copy()
         p['z'] = catalog[catalog.band.eq(band)].set_index('OBJID').reindex(oid).z
         lag = mean_lag(boot, band)
+        # half-open at the median (each quasar in one group)
         masks = {'fiducial':np.ones(len(oid),bool)}
         for i,ml in enumerate(['lowmbh','highmbh']):
             for j,el in enumerate(['lowedd','highedd']):
@@ -113,6 +117,7 @@ def adopted_reps(band, name, a):
 
 
 def covariance(reps):
+    # Ledoit & Wolf 2004 shrinkage of standardized replicates (keeps bin variances)
     sd = np.std(reps,axis=0,ddof=1)
     return esf.ledoit_wolf(reps/sd)[0]*np.outer(sd,sd)
 
@@ -127,20 +132,25 @@ def all_bin_fits(a, grid, reps, lag):
         fit rows, drw then bending_psd
         residual rows per model and bin
     """
+    # equal-quasar SF, fitting bins with positive SF^2
     sf = np.sqrt(np.maximum(esf.object_second_moments(a).mean(axis=0),0))
     use = sf > 0
     dt,y,n = fsf.CENTERS[:len(sf)][use],sf[use],int(use.sum())
     lag = bin_lag(a, lag)[use]
+    # diagonal weights in the fit, full covariance in chi2 and tests
     err,C = reps[:,use].std(axis=0,ddof=1),covariance(reps[:,use])
     w,full,long = err**-2,cho_factor(C),dt > fsf.LONG_MIN_D
     prec = np.sqrt(np.diag(cho_solve(full,np.eye(n))))
     lo,hi = grid.grid[1][[0,-1]]
+    # models at each bin's mean pair lag (can lie far from the center)
     shape = lambda t,alpha:np.sqrt(-np.expm1(-lag/10**t) if alpha == 0 else
                                    grid(np.column_stack([np.full(n,alpha),np.clip(np.log10(lag)-t,lo,hi)])))
+    # exact linear amplitude at each tau and alpha
     def trial(t,alpha):
         u = shape(t,alpha)
         amp = (w*u)@y/((w*u)@u)
         return float(w@(y-amp*u)**2),amp
+    # 65-node log tau grid, refined around its best node
     def profile(alpha):
         ts = np.linspace(1,5,65)
         k = int(np.argmin([trial(t,alpha)[0] for t in ts]))
@@ -150,15 +160,18 @@ def all_bin_fits(a, grid, reps, lag):
         return dict(alpha=float(alpha),chi2=cost,logtau=t,amp=amp)
     profiles = [profile(x) for x in ALPHA]
     fits,resid = {},[]
+    # DRW is the alpha 0 profile, free slope the best over alpha
     for name,prof in [('drw',[profiles[int(np.flatnonzero(ALPHA == 0)[0])]]),('bending_psd',profiles)]:
         p = min(prof,key=lambda q:q['chi2'])
         free,tau = len(prof) > 1,10**p['logtau']
         model = lambda q:q[0]*shape(q[1],p['alpha'])
         q = np.array([p['amp'],p['logtau']])
+        # propagate the bin covariance into the fit parameter errors
         J = np.column_stack([(model(q+d)-model(q-d))/(2*d.sum()) for d in np.diag([1e-6*q[0],1e-5])])
         A = np.linalg.solve(J.T@(w[:,None]*J),(w[:,None]*J).T)
         P = A@C@A.T
         e = np.sqrt(np.diag(P))
+        # alpha interval at delta chi2 <= 1
         accepted = [x['alpha'] for x in prof if x['chi2'] <= p['chi2']+1] if free else []
         k = 2+free
         pred = model(q)
@@ -171,6 +184,7 @@ def all_bin_fits(a, grid, reps, lag):
             alpha_profile_hi=max(accepted,default=np.nan),alpha_boundary=free and p['alpha'] in ALPHA[[0,-1]],
             alpha_profile_truncated=bool(accepted) and (min(accepted)==ALPHA[0] or max(accepted)==ALPHA[-1]),
             tau_boundary=tau < 10.01 or tau > 99990)
+        # DRW residual tests beyond 11 years (DRW nearly flat there)
         if not free:
             R = np.eye(n)-J@A
             # parameter term scaled by max(reduced chi2, 1)
@@ -183,6 +197,7 @@ def all_bin_fits(a, grid, reps, lag):
         resid += [dict(model=name,lag_center_days=t,lag_days=l,sf_mag=v,sf_err_mag=s,model_mag=m,relative_residual=v/m-1,
                        relative_residual_err=s/m,chi2_contribution=c2,conditional_pull=pull)
                   for t,l,v,s,m,c2,pull in zip(dt,lag,y,err,pred,r*ci,ci/prec)]
+    # free slope vs DRW, delta chi2 and F test (rescaled for misfit)
     B = fits['bending_psd']
     d = fits['drw']['chi2_diag']-B['chi2_diag']
     pv,pf = chi2.sf(d,1),fdist.sf(d/max(B['reduced_chi2_diag'],1.),1,B['dof'])
@@ -193,6 +208,7 @@ def all_bin_fits(a, grid, reps, lag):
 def nested_checks(a, prop, seed):
     values = esf.object_second_moments(a)
     n,nb = values.shape
+    # narrower property and redshift ranges (a mixing rise would shrink)
     masks={'original':np.ones(n,bool)}
     for fraction in [.8,.6]:
         keep=np.ones(n,bool)
@@ -203,6 +219,7 @@ def nested_checks(a, prop, seed):
     lo,hi=prop.z.quantile([.25,.75])
     masks['central_50_redshift']=prop.z.between(lo,hi).to_numpy()
     masks['redshift_060_090']=prop.z.between(.6,.9).to_numpy()
+    # shared draws (paired changes in rise)
     rng=np.random.default_rng(seed)
     counts=rng.multinomial(n,np.full(n,1/n),size=5000)
     anchor=int(np.argmin(abs(fsf.CENTERS[:nb]-2371)))
@@ -224,6 +241,7 @@ def nested_checks(a, prop, seed):
         for k in range(nb):
             curves.append(dict(selection=label,n_objects=m,lag_center_days=fsf.CENTERS[k],
                                sf_mag=sf[k],sf_lo_mag=bounds[0,k],sf_hi_mag=bounds[1,k]))
+        # rise over 2371 d (last nearly all-CCD bin) and its paired change
         for k in np.flatnonzero(fsf.CENTERS[:nb] > fsf.SHORT_MAX_D):
             rise=sf[k]-sf[anchor]
             draws=boot[:,k]-boot[:,anchor]
@@ -247,6 +265,7 @@ def nested_checks(a, prop, seed):
 
 
 def greedy(a,stat,steps=2,key=lambda s:s):
+    # greedy removal of the most influential quasars
     keep,path=np.ones(len(a),bool),[(-1,stat(a))]
     for _ in range(steps):
         trial={i:stat(a[keep&(np.arange(len(a))!=i)]) for i in np.flatnonzero(keep)}
@@ -263,6 +282,7 @@ def lowmass_influence():
         if name not in GROUPS[:2]:
             continue
         ids=prop.index.to_numpy(str)
+        # DRW excess with and without its most influential quasars
         def drw(i):
             return next(f for f in all_bin_fits(a[i],grid,adopted_reps(band,name,a[i]),lag[i])[0] if f['model']=='drw')
         (_,f),*drops=greedy(np.arange(len(a)),drw,key=lambda f:f['long_sigma_param_scaled'])
@@ -280,10 +300,12 @@ def band_ratio():
         ids=[f[f'fiducial_ids_{b}'] for b in esf.BANDS]
         common=np.intersect1d(*ids)
         g,r=[esf.object_second_moments(f[f'fiducial_acc_{b}'][np.searchsorted(i,common)]) for b,i in zip(esf.BANDS,ids)]
+    # same quasars in both bands, shared draws for the ratio
     r=r[:,:g.shape[1]]
     draw=np.random.default_rng(20260928).integers(0,len(common),(5000,len(common)))
     lo,hi=np.percentile(np.sqrt(r[draw].mean(1)/g[draw].mean(1)),[16,84],axis=0)
     sf_g,sf_r=np.sqrt(g.mean(0)),np.sqrt(r.mean(0))
+    # expected ratio from MacLeod et al. 2010 wavelength scalings of SF_inf and tau
     w=fsf.POPDRW_LAM_OBS['r']/fsf.POPDRW_LAM_OBS['g']
     b_sf,b_tau=fsf.POPDRW_COEF['sfinf'][1],fsf.POPDRW_COEF['tau'][1]
     pd.DataFrame(dict(lag_center_days=fsf.CENTERS[:len(sf_g)],n_objects=len(common),sf_g_mag=sf_g,sf_r_mag=sf_r,
@@ -300,6 +322,7 @@ def group_trends():
     rows=[]
     for selection,d in [('all',matched),('redshift_060_090',narrow)]:
         for band in esf.BANDS:
+            # one property's effect with the other fixed, at 2371 d
             for fixed,(lo,hi) in pairs.items():
                 x,y=(d[d.band.eq(band)&d['sample'].eq(s)].set_index('lag_center_days') for s in (lo,hi))
                 if x.empty or y.empty:
@@ -327,6 +350,7 @@ def noise_fraction():
             nt=esf.clean_nightly(load_completeness_lightcurves(ids)).query('band == @b')
             a=esf.accumulate(nt,ids,zmap,bands=[b],resid=True)[:,0,:nb]
             n=a[...,0]
+            # each bin's mean dm^2 split into noise, residual plate variance and SF^2
             dm2,noise,cal=((x/n).mean(0) for x in (a[...,1],a[...,2]-a[...,4],a[...,4]))
             sf2=dm2-noise-cal
             np.testing.assert_allclose(sf2,esf.ensemble_second_moment(fid),rtol=1e-9)
@@ -351,6 +375,7 @@ def star_floor(lo, hi, n_boot=2000, seed=930):
     for sv, s in lc.groupby('survey'):
         nt = esf.condense_nightly(s)
         ids = np.sort(nt.OBJID.unique())
+        # CCD star noise floor, z = 0 and all lags pooled (stars don't vary)
         acc = esf.accumulate(nt, ids, pd.Series(0., index=ids)).sum(axis=2)
         for bi, b in enumerate(esf.BANDS):
             use = acc[:, bi, 0] > 0
@@ -376,6 +401,7 @@ def fit_range():
         nb, ids = a.shape[1], prop.index.to_numpy(str)
         nt = esf.clean_nightly(load_completeness_lightcurves(ids)).query('band == @b')
         coef = []
+        # each survey's share of pair epochs (unit errors on that survey)
         for s in ccd:
             acc = esf.accumulate(nt.assign(mag=0., sig=nt.survey.eq(s).astype(float)), ids, prop.z, bands=[b])[:, 0, :nb]
             np.testing.assert_array_equal(acc[..., 0], a[..., 0])
@@ -383,6 +409,7 @@ def fit_range():
         floor = np.array([stars[s, b][0] for s in ccd])@coef
         floor_reps = np.stack([stars[s, b][1] for s in ccd], axis=1)@coef
         sf, sigma = np.sqrt(esf.ensemble_second_moment(a)), r.std(axis=0, ddof=1)
+        # SF shift if the star floor were subtracted (not applied)
         shift, n = sf-np.sqrt(sf**2-floor), pairs[b][..., :nb]
         rows += [dict(band=b, bin=k, lag_center_days=C[k], n_objects=len(a), sf_mag=sf[k], sf_err_mag=sigma[k],
                       floor_mag2=floor[k], floor_err_mag2=floor_reps[:, k].std(ddof=1), shift_mag=shift[k],
@@ -393,6 +420,7 @@ def fit_range():
                       **{f'star_floor_{s}_err_mag2': stars[s, b][1].std(ddof=1) for s in ccd}) for k in range(nb)]
     fl = pd.DataFrame(rows)
     wide = lambda c: fl.pivot(index='bin', columns='band', values=c)
+    # fit range, >= 99% CCD-pair bins where the star floor moves < 1 sigma
     end = int(np.flatnonzero(wide('ccd_pair_fraction_object').ge(.99).all(axis=1).to_numpy())[-1])
     fail = np.flatnonzero(~wide('shift_over_sigma').abs().lt(1).all(axis=1).to_numpy()[:end+1])
     fl.assign(criterion_start_days=C[fail[-1]+1 if len(fail) else 0], criterion_end_days=C[end]).to_csv(
@@ -406,6 +434,7 @@ def fiducial_nightly():
     nightly = esf.clean_nightly(lc)
     for band, _, base, p, _ in selected:
         n = nightly[nightly.band.eq(band) & nightly.OBJID.isin(p.index)].reset_index(drop=True)
+        # unedited sums must match the stored fiducial
         run = lambda x, ids=p.index.to_numpy(): esf.accumulate(x, ids, p.z, bands=[band], edges=esf.EDGES[:base.shape[1]+1], resid=True)[:, 0]
         real = run(n)
         np.testing.assert_allclose(real[..., :3], base[..., :3], rtol=1e-10, atol=1e-8)
@@ -427,6 +456,7 @@ def replace_plate_epochs(n, rng, variant):
         if variant == 'ccd_median':
             source, var = np.full(len(plate), np.median(m[ccd])), s2[plate]+fv[plate]
         else:
+            # ccd_night uniform over nights, ccd_survey uniform over surveys
             _, inv, count = np.unique(survey[ccd], return_inverse=True, return_counts=True)
             pick = rng.choice(ccd, len(plate), replace=False, p=None if variant == 'ccd_night' else 1/(len(count)*count[inv]))
             source, var = m[pick], s2[plate]+fv[plate]-s2[pick]
@@ -441,10 +471,12 @@ def plate_replacement(n_rep=200):
     rows, variants = [], ['ccd_night', 'ccd_survey', 'ccd_median']
     for bi, (band, base, p, n, run, real, _) in enumerate(fiducial_nightly()):
         rng = np.random.default_rng(10050+bi)
+        # only magnitudes change (counts, noise and lags identical)
         draws = {v: np.stack([run(replace_plate_epochs(n, rng, v)) for _ in range(n_rep)]) for v in variants}
         fixed_slots = [0, 2, 3, 4, 5]
         for d in draws.values():
             np.testing.assert_array_equal(d[..., fixed_slots], np.broadcast_to(real[..., fixed_slots], d[..., fixed_slots].shape))
+        # one bootstrap for real and replaced sums (paired difference)
         stack = np.stack([real, *(d.mean(axis=0) for d in draws.values())], axis=1)
         bounds, boot = (np.sqrt(np.maximum(x, 0)) for x in esf.object_bootstrap(stack, *fsf.bootstrap_plan(band, 'fiducial')))
         sf = np.sqrt(np.maximum(esf.ensemble_second_moment(stack), 0))

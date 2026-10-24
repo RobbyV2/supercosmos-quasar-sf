@@ -17,9 +17,11 @@ ROOT = Path(__file__).resolve().parents[1]
 NATIVE_WORK = ROOT / "temp/native_sed_calibration"
 NATIVE_BASE = NATIVE_WORK
 NATIVE_VARIANT = "primary"
+# plate band per series (Tech Pan plates set separately)
 NATIVE_BAND = {"SERC-J/EJ": "bj", "SERC-R/AAO-R": "r", "POSSI-E(S)": "e"}
 
 
+# spatial terms, first n polynomials or B-splines (11, 17)
 FIELD_NAMES=("fx","fy","frr","fx2_y2","fxy")
 FIELD_COLUMNS=tuple(f"field_{k}" for k in range(17))
 
@@ -30,6 +32,7 @@ def native_field(xi,eta,spatial):
         step=2 if spatial==11 else 1
         xknots=np.r_[np.repeat(-4.,4),np.arange(-4.+step,4.,step),np.repeat(4.,4)]
         yknots=np.r_[np.repeat(-2.,4),np.arange(-2.+step,2.,step),np.repeat(2.,4)]
+        # drop the last basis (B-splines sum to one, degenerate with the zero point)
         x=BSpline.design_matrix(xi,xknots,3,extrapolate=True).toarray()[:,:-1]
         y=BSpline.design_matrix(eta,yknots,3,extrapolate=True).toarray()[:,:-1]
         return np.column_stack([x,y,xi*eta])
@@ -50,6 +53,7 @@ def huber_loss(r):
 
 def native_robust_fit(A, y):
     c = np.linalg.lstsq(A, y, rcond=None)[0]
+    # Huber reweighting (outlying stars lose weight)
     for _ in range(8):
         r = y-A@c
         scale = max(al._mad_sigma(r), .01)
@@ -100,16 +104,19 @@ def native_inputs():
             column = f"{band}_native_{NATIVE_VARIANT}_shift"
             if column in stars:
                 stars[band+"_native"] += stars[column]
+        # adopted B_J factor (flattens color residuals) and OG590 red shifts
         if NATIVE_VARIANT=="effective":
             stars["bj_native"]+=stars.bj_native_factor_shift
             stars["r_native"]+=stars.r_native_og590_shift
             stars["r_native_err"]=stars.r_native_og590_err
     if not stars.index.is_unique:
         raise ValueError("Duplicate stellar SED identity")
+    # drop blended parents (biased bright), one detection per star and plate
     det = al.drop_blended_parents(al.star_detections_cached().rename(columns=al._STAR_BLEND)).rename(
         columns={v:k for k,v in al._STAR_BLEND.items()})
     det = det[det.SURVEYNAME.isin(NATIVE_BAND)].copy()
     det["native"] = det.SURVEYNAME.map(NATIVE_BAND)
+    # Tech Pan plates get their own response (Parker & Malin 1999)
     det.loc[det.plate.isin((131900,131903)),"native"] = "tp"
     det["band"] = det.SURVEYNAME.map(al.SURVEY_SDSS_BAND)
     native = np.where(det.possi, "R1", det.bi.map(al._SSS_BI_BAND))
@@ -120,6 +127,7 @@ def native_inputs():
     det["color"] = (x.g-x.r).to_numpy()
     for a,b in zip("ugri","griz"):
         det[a+"_"+b] = (x[a]-x[b]).to_numpy()
+    # predicted plate magnitude from each star's SED fit, the calibration target
     for key, suffix in (("expected", "_native"), ("expected_error", "_native_err")):
         det[key] = np.select([det.native.eq(b) for b in ("bj","r","e","tp")],
                              [x[b+suffix].to_numpy() for b in ("bj","r","e","tp")],default=np.nan)
@@ -137,17 +145,20 @@ def native_calibration():
     eligible = stars.fit_ok.to_numpy(bool) & (folds != 4)
     centers = al.plate_centers()
     for plate, d in det.groupby("plate", sort=True):
+        # good SED fits only
         d = d[d.fit_ok & np.isfinite(d.expected+d.expected_error)].copy()
         train = d.fold.ne(4)
         if train.sum() < 1000:
             coverage.append(dict(plate=plate, status="fewer than 1000 fitting detections"))
             continue
+        # calibration box = the fitting stars' xi, eta range
         box = {name+"_"+side: float(np.quantile(d.loc[train,name], q))
                for name in ("xi","eta") for side,q in (("lo",0.),("hi",1.))}
         xi, eta = al.field_coords(np.full(len(stars),plate), stars.ra.to_numpy(), stars.dec.to_numpy(), centers)
         inside = eligible & (xi >= box["xi_lo"]) & (xi <= box["xi_hi"]) & (eta >= box["eta_lo"]) & (eta <= box["eta_hi"])
         column = d.native.iloc[0]+"_native"
         expected = stars[column].to_numpy()
+        # fit range where the plate detects nearly all stars, per 0.25 mag
         edges = np.arange(13., 23.26, .25)
         total = np.histogram(expected[inside], edges)[0]
         seen = np.histogram(d.loc[train & d.star.isin(stars.index[inside]), "expected"], edges)[0]
@@ -166,9 +177,11 @@ def native_calibration():
         center, scale = (lo+hi)/2,(hi-lo)/2
         support = d.expected.between(lo,hi) & d.xi.between(box["xi_lo"],box["xi_hi"]) & d.eta.between(box["eta_lo"],box["eta_hi"])
         learn = d[train & support]
+        # archive minus predicted mag, fit in magnitude and plate position
         y = (learn.SMAG-learn.expected).to_numpy()
         trials = []
         grid = np.linspace(-1,1,200)
+        # 4-fold CV over degree and spatial terms, monotone responses only
         for degree in (1,2,3):
             for spatial in (0,2,3,5,11,17):
                 A = native_design(learn.expected.to_numpy(), learn.xi.to_numpy(), learn.eta.to_numpy(), center,scale,degree,spatial)
@@ -189,6 +202,7 @@ def native_calibration():
             coverage.append(dict(plate=plate,status="no monotone response"))
             continue
         best = min(permitted,key=lambda t:t["loss"])
+        # simplest model within one paired SE of the best CV loss
         paired_se=lambda t:np.std([t[f"fold_loss_{k}"]-best[f"fold_loss_{k}"] for k in range(4)],ddof=1)/2
         selected = min((t for t in permitted if t["loss"]-best["loss"]<=paired_se(t)+1e-15),
                        key=lambda t:(t["degree"]+t["spatial"],t["loss"]))
@@ -207,6 +221,7 @@ def native_calibration():
         for t in trials:
             t["selected"] = t is selected
         validation.extend(trials)
+        # withheld stars (fold 4), in no fit
         test = d[d.fold.eq(4)].copy()
         corrected,derivative,ok = native_inverse(test.SMAG.to_numpy(),test.xi.to_numpy(),test.eta.to_numpy(),p)
         test["corrected_native"],test["response_derivative"],test["supported"] = corrected,derivative,ok
@@ -214,6 +229,7 @@ def native_calibration():
         test["expected_supported"] = test.expected.between(lo,hi)&test.xi.between(box["xi_lo"],box["xi_hi"])&test.eta.between(box["eta_lo"],box["eta_hi"])
         A=native_design(test.expected.to_numpy(),test.xi.to_numpy(),test.eta.to_numpy(),center,scale,degree,spatial)
         derivative_at_expected=1+np.polynomial.legendre.legval((test.expected-center)/scale,np.polynomial.legendre.legder(c[:degree+1]))/scale
+        # residuals in calibrated mags, divided by the response slope
         test["forward_residual_raw_mag"] = test.SMAG-test.expected-A@c
         test["residual_mag"] = test.forward_residual_raw_mag/derivative_at_expected
         held.append(test)
@@ -234,6 +250,7 @@ def native_calibration():
 
 
 def raw_quasars():
+    # same cleaning as the stars (no blended parents or saturated detections)
     raw = al.assign_group_ids_by_sky(al.sss_raw())
     mapping = al.match_groups_to_catalog(raw, str(ROOT/"data/S82/Catalog.parquet"))
     q = al.drop_blended_parents(raw.drop(columns=["OBJID","z"],errors="ignore").merge(mapping,on="GROUP_ID",how="inner"))
@@ -259,6 +276,7 @@ def native_quasars():
     coefficients = pd.read_csv(NATIVE_WORK/"coefficients.csv",float_precision="round_trip").set_index("plate")
     xi,eta = al.field_coords(q.PLATEID.to_numpy(),q.RA.to_numpy(),q.DEC.to_numpy())
     q["native_mag"],q["response_derivative"],q["supported"] = np.nan,np.nan,False
+    # invert each plate's response for the quasar epochs
     for plate, idx in q.groupby("PLATEID").groups.items():
         if plate not in coefficients.index:
             continue
@@ -266,6 +284,7 @@ def native_quasars():
         result=native_inverse(q.loc[idx,"SMAG"].to_numpy(),xi[loc],eta[loc],coefficients.loc[plate])
         for name,values in zip(("native_mag","response_derivative","supported"),result):
             q.loc[idx,name]=values
+    # Schlegel et al. 1998 dust, rescaled as for the stars (Schlafly & Finkbeiner 2011)
     dust_path=NATIVE_BASE/"quasar_dust.csv"
     if not dust_path.exists():
         cat=pd.read_parquet(ROOT/"data/S82/Catalog.parquet")
@@ -278,9 +297,11 @@ def native_quasars():
     objects["ebv"] = dust.ebv.reindex(objects.index)
     if objects.ebv.isna().any():
         raise ValueError("Missing consistently scaled quasar foreground reddening")
+    # plate to SDSS with the redshifted Vanden Berk et al. 2001 composite
     template=Table.read(ROOT/"data/vandenberk_qso_composite_cds.txt",format="ascii.cds")
     wave,flux=np.asarray(template["Wave"],float),np.asarray(template["FluxD"],float)
     bands={b:al.read_bandpass(name) for b,name in {"bj":"serc-j.txt","r":"serc-r.txt","e":"possi-e.txt","tp":"techpan_og590.txt","sdss_g":"SLOAN_SDSS.g.dat","sdss_r":"SLOAN_SDSS.r.dat"}.items()}
+    # same plate responses as the stars
     if NATIVE_VARIANT == "energy":
         for b in ("bj","r","e"):
             w,t=bands[b]
@@ -296,6 +317,7 @@ def native_quasars():
         f=redden(w,flux[use]/(1+p.z),p.ebv)
         w=al.vac_to_air(w)
         mags={b:al.abmag(w,f,*bp) for b,bp in bands.items()}
+        # Vega plate mags to the SDSS scale (r 0.015 mag off AB)
         terms.append(dict(OBJID=obj,ebv=p.ebv,
                           bj=mags["sdss_g"]-mags["bj"]+vega["bj"],
                           r=mags["sdss_r"]-mags["r"]+vega["r"]-.015,
@@ -305,6 +327,7 @@ def native_quasars():
     terms.to_csv(NATIVE_WORK/"quasar_sed_terms.csv")
     matched=terms.reindex(q.OBJID)
     q["sed_term"] = np.select([q.native.eq(b) for b in ("bj","r","e","tp")],[matched[b].to_numpy() for b in ("bj","r","e","tp")],default=np.nan)
+    # SDSS asinh mags as in the CCD light curves (Lupton et al. 1999)
     pogson=q.native_mag+q.sed_term
     softening=np.where(q.band.eq("g"),9e-11,1.2e-10)
     q["mag"] = -2.5/np.log(10)*(np.arcsinh(10**(-.4*pogson)/(2*softening))+np.log(softening))
@@ -326,6 +349,7 @@ def native_validation():
     for band in "gr":
         d.loc[d.band.eq(band),"in_fiducial_range"] = d.loc[d.band.eq(band),"reference"].between(*limits.loc[band])
     bins=[]
+    # withheld-star residuals binned by magnitude, color and plate position
     for (survey,plate),g in d[d.expected_supported].groupby(["SURVEYNAME","plate"]):
         for axis,width in (("reference",.25),("u_g",.25),("g_r",.25),("r_i",.25),("i_z",.25),("xi",.5),("eta",.25)):
             for cell,q in g[g.in_fiducial_range].groupby(np.floor(g.loc[g.in_fiducial_range,axis]/width)):
@@ -339,6 +363,7 @@ def native_validation():
     bins=pd.DataFrame(bins)
     bins.to_csv(NATIVE_WORK/"validation_bins.csv",index=False)
     rows=[]
+    # per-series summary over the fiducial magnitude range
     for survey,g in d.groupby("SURVEYNAME"):
         accepted=g.expected_supported&g.in_fiducial_range&np.isfinite(g.old_residual_mag)
         for model,column in (("old","old_residual_mag"),("native","residual_mag")):
@@ -374,8 +399,10 @@ def native_noise():
         names=FIELD_COLUMNS if FIELD_COLUMNS[0] in p else FIELD_NAMES
         field=native_field(d.xi.to_numpy(),d.eta.to_numpy(),count)@p[list(names[:count])].to_numpy(float)
         forward=(d.SMAG-d.expected-np.polynomial.legendre.legval(at,c)-field)/response
+        # stars past the invertible range keep the forward residual
         d["residual"]=np.where(supported,m-d.expected,forward)
         d["inverse_supported"]=supported
+        # distance to the fit-range edges, in fit-scatter sigma
         d["boundary_distance"]=np.minimum(d.expected-p.mag_lo,p.mag_hi-d.expected)
         d["boundary_sigma"]=d.boundary_distance/(p.fit_scatter/response)
         d["reference_variance"]=np.where(d.band.eq("g"),stars.g_err.reindex(d.star),stars.r_err.reindex(d.star))**2
@@ -383,6 +410,7 @@ def native_noise():
     epochs=pd.concat(rows,ignore_index=True)
     epochs.to_parquet(NATIVE_WORK/"star_epochs.parquet",index=False)
     e=epochs.sort_values(["star","band"],kind="stable").reset_index(drop=True)
+    # plate errors from stars on two plates, per plate band and 0.5 mag
     i,j=esf.group_pairs(e.star.to_numpy()*2+e.band.eq("r").to_numpy())
     code=e.native.map({"bj":0,"r":1,"e":2,"tp":3}).to_numpy()*100+np.floor(e.expected.to_numpy()*2).astype(int)
     pairs=pd.DataFrame(dict(star=e.star.to_numpy()[i],fold=e.fold.to_numpy()[i],
@@ -391,6 +419,7 @@ def native_noise():
         boundary=np.minimum(e.boundary_sigma.to_numpy()[i],e.boundary_sigma.to_numpy()[j])))
     pairs["bin"]=np.floor(pairs.mag*2).astype(int)
     noise,checks=[],[]
+    # pair variance = sum of two epoch variances, solved per class (clipped)
     training=pairs[pairs.fold.ne(4)&pairs.boundary.ge(3)]
     edges,y,weight,clip=[],[],[],{}
     for (a,b),q in training.groupby(["a","b"]):
@@ -409,6 +438,7 @@ def native_noise():
         support=training[training.a.eq(k)|training.b.eq(k)]
         noise.append(dict(native=("bj","r","e","tp")[native],mag_lo=mb/2,mag_hi=(mb+1)/2,variance=value,sigma=np.sqrt(value),
                           n_training_pairs=len(support),n_training_stars=support.star.nunique()))
+    # check predicted pair scatter on withheld stars
     for (a,b),q in pairs.groupby(["a","b"]):
         if a not in v or b not in v or (a,b) not in clip:continue
         center,limit=clip[(a,b)]
@@ -423,6 +453,7 @@ def native_noise():
                     mean=z.dm.mean(),median=z.dm.median()))
     noise=pd.DataFrame(noise);noise.to_csv(NATIVE_WORK/"random_errors.csv",index=False)
     pd.DataFrame(checks).to_csv(NATIVE_WORK/"random_error_validation.csv",index=False)
+    # epoch noise variance from the error curves
     e["s2"]=np.nan
     for native,g in noise.groupby("native"):
         use=e.native.eq(native)
@@ -430,6 +461,7 @@ def native_noise():
         e.loc[use,"s2"]=np.interp(at,(g.mag_lo+g.mag_hi)/2,g.variance)
         e.loc[use&~e.expected.between(g.mag_lo.min(),g.mag_hi.max()),"s2"]=np.nan
     e=e[np.isfinite(e.s2)].copy()
+    # catalog mag as a CCD epoch, for plate-CCD pairs as in the quasars
     ccd=e.drop_duplicates(["star","band"]).copy()
     ccd["native"],ccd["residual"],ccd["s2"],ccd["boundary_sigma"]="ccd",0.,ccd.reference_variance,np.inf
     e=pd.concat([e,ccd],ignore_index=True).sort_values(["star","band"],kind="stable").reset_index(drop=True)
@@ -441,6 +473,7 @@ def native_noise():
         boundary=np.minimum(e.boundary_sigma.to_numpy()[i],e.boundary_sigma.to_numpy()[j])))
     pairs["bin"]=np.floor(pairs.mag*2).astype(int)
     floor,bootstrap=[],[]
+    # residual plate variance per pair class and 0.5 mag (would mimic variability)
     for (a,b,mb),g in pairs.groupby(["a","b","bin"]):
         training=g[g.fold.ne(4)&g.boundary.ge(3)]
         if len(training)<100:continue
@@ -471,6 +504,7 @@ def native_noise():
     jj=np.repeat(np.arange(len(bootstrap)),[len(x) for x in bootstrap]);value=np.concatenate([x.to_numpy() for x in bootstrap])
     V=coo_matrix((value,(ii,jj)),shape=(len(ids),len(bootstrap))).tocsr()
     W=coo_matrix((np.ones(len(value)),(ii,jj)),shape=V.shape).tocsr()
+    # Poisson star bootstrap (classes sharing stars stay correlated)
     rng=np.random.default_rng(8141);draws=[]
     for _ in range(20):
         weights=rng.poisson(1,(20,len(ids)))
@@ -491,6 +525,7 @@ def native_products(work):
         q.loc[use,"error_supported"]=q.loc[use,"native_mag"].between(g.mag_lo.min(),g.mag_hi.max())
     q["supported"]=q.calibration_supported&q.error_supported&np.isfinite(q.mag+q.magerr)&q.magerr.gt(0)
     q["support_reason"]=np.where(q.supported,"supported",np.where(q.calibration_supported,"random-error range","instrumental response or stellar footprint"))
+    # fitting stars 3 sigma inside the range (withheld stars test it)
     return floor[floor.subset.eq("training")&floor.boundary_sigma_min.eq(3)].drop_duplicates("class_id"),q
 
 
@@ -534,6 +569,7 @@ def native_longform(q=None):
 def native_null():
     from scipy.sparse import coo_matrix
     e=pd.read_parquet(NATIVE_WORK/"star_epochs.parquet")
+    # withheld stars only (fitting stars give zero SF by construction)
     e=e[e.fold.eq(4)&e.boundary_sigma.ge(3)].copy()
     e["s2"]=np.nan
     noise=pd.read_csv(ROOT/"data/plate_native_random_errors.csv")
@@ -541,6 +577,7 @@ def native_null():
         use=e.native.eq(native)&e.expected.between(g.mag_lo.min(),g.mag_hi.max())
         e.loc[use,"s2"]=np.interp(e.loc[use,"expected"]+e.loc[use,"residual"],(g.mag_lo+g.mag_hi)/2,g.variance)
     e=e[np.isfinite(e.s2)]
+    # catalog mag as the CCD epoch, as in the error fit
     ccd=e.drop_duplicates(["star","band"]).copy()
     ccd["native"],ccd["residual"],ccd["s2"],ccd["mjd"],ccd["plate"]="ccd",0.,ccd.reference_variance,sn.CCD_MJD,-1
     e=pd.concat([e,ccd],ignore_index=True).sort_values(["star","band"],kind="stable").reset_index(drop=True)
@@ -553,6 +590,7 @@ def native_null():
     table=pd.read_csv(ROOT/"data/plate_native_pair_variance.csv")
     native=("ccd","bj","r","e","tp")
     p["class_id"]=-1;p["floor"],p["center"],p["limit"]=np.nan,np.nan,np.nan
+    # training's residual plate variance and clip, per pair class and mag
     for (a,b),q in table.groupby(["native_a","native_b"]):
         use=p.a.eq(native.index(a))&p.b.eq(native.index(b))
         q=q.sort_values("mag_lo");centers=(q.mag_lo+q.mag_hi).to_numpy()/2
@@ -561,22 +599,26 @@ def native_null():
             p.loc[use,col]=q[source].to_numpy()[pos]
     p["bin"]=np.searchsorted(sn.NULL_LAG,p.lag,side="right")-1
     p=p[p.class_id.ge(0)&p.bin.ge(0)&p.bin.lt(len(sn.NULL_LAG)-1)&(p.dm-p.center).abs().le(p.limit)].copy()
+    # non-variable stars, zero SF^2 expected after noise and residual plate variance
     p["before"]=p.dm**2-p.se2;p["after"]=p.before-p.floor
     limits=sn._fiducial_limits();draws=np.load(ROOT/"data/plate_native_pair_variance_bootstrap.npz")["draws"]
     rows,covariances=[],{}
     rng=np.random.default_rng(731091)
     for band in "gr":
         lo,hi=limits.loc[band];q=p[p.band.eq(band)&p.mag.between(lo,hi)]
+        # equal star weights (equal quasar weights in the SF)
         stats=q.groupby(["star","bin"])[["before","after"]].mean().reset_index()
         ids,si=np.unique(stats.star,return_inverse=True);nb=len(sn.NULL_LAG)-1
         counts=coo_matrix((np.ones(len(stats)),(si,stats.bin)),shape=(len(ids),nb)).tocsr()
         values=coo_matrix((stats.before,(si,stats.bin)),shape=counts.shape).tocsr()
         n=np.asarray(counts.sum(axis=0)).ravel();mean=np.asarray(values.sum(axis=0)).ravel()/np.maximum(n,1)
+        # Poisson star bootstrap with residual plate variance draws
         boot=[]
         for start in range(0,len(draws),40):
             w=rng.poisson(1,(min(40,len(draws)-start),len(ids)))
             denom=np.asarray(w@counts);boot.append(np.divide(w@values,denom,out=np.full(denom.shape,np.nan),where=denom>0))
         boot=np.concatenate(boot)
+        # weight residual plate variance draws by each bin's pair-class mix
         weight=q.groupby(["star","bin","class_id"]).size().rename("n").reset_index()
         weight["fraction"]=weight.n/weight.groupby(["star","bin"]).n.transform("sum")
         mix=weight.groupby(["bin","class_id"]).fraction.sum().unstack(fill_value=0).reindex(index=range(nb),columns=range(draws.shape[1]),fill_value=0).to_numpy()/np.maximum(n[:,None],1)
@@ -584,6 +626,7 @@ def native_null():
         after=mean-mix@floor
         varied=boot-(draws-draws.mean(axis=0))@mix.T-mix@floor
         plates=np.unique(np.r_[q.pi,q.pj]);plates=plates[plates>=0]
+        # plate jackknife plus residual plate variance draws (stars share plate errors)
         jack=[]
         for plate in plates:
             leave=q[q.pi.ne(plate)&q.pj.ne(plate)].groupby(["star","bin"])[["before","after"]].mean().groupby("bin").mean().reindex(range(nb))
@@ -598,6 +641,7 @@ def native_null():
         for k in np.flatnonzero(n>=30):
             z=q[q.bin.eq(k)];plates=np.unique(np.r_[z.pi,z.pj]);plates=plates[plates>=0]
             valid=len(plates)>=3 and np.isfinite(jack[:,k]).all()
+            # star bootstrap below three plates
             if not valid:
                 before_error[k]=np.nanstd(boot[:,k],ddof=1)
                 after_error[k]=np.nanstd(varied[:,k],ddof=1)
@@ -625,6 +669,7 @@ def native_floor_impact():
     codes={"ccd":0,"bj":1,"r":2,"e":3,"tp":5}
     null=pd.read_csv(ROOT/"data/standard_star_adopted_null_structure_function.csv")
     objects={};rng=np.random.default_rng(42115)
+    # quasar SF shift from residual plate variance uncertainty and the star null
     for (obj,band),g in nightly.groupby(["OBJID","band"],observed=True,sort=False):
         if band not in "gr":continue
         g=g.sort_values("time",kind="stable")
@@ -633,8 +678,10 @@ def native_floor_impact():
         bins=np.searchsorted(esf.EDGES,observed/(1+redshift[obj]),side="right")-1
         use=(bins>=0)&(bins<esf.NB);i,j,bins,observed=i[use],j[use],bins[use],observed[use]
         dm=mag[j]-mag[i];w=2/(vt[i]+vt[j]);code=g.pcode.to_numpy()
+        # pair moment minus noise and residual plate variance, as in the SF estimator
         moment=w*(dm**2-sig[i]**2-sig[j]**2-g[esf.FV_COLS].to_numpy()[i,code[j]])
         cls=np.full(len(i),-1,dtype=int)
+        # pair class at the CCD median mag (independent of dm)
         ref=g.loc[~g.sss,"mag"].median()
         for (a,b),q in table.groupby(["native_a","native_b"]):
             q=q.sort_values("mag_lo");cen=(q.mag_lo+q.mag_hi).to_numpy()/2
@@ -642,9 +689,11 @@ def native_floor_impact():
             use=((code[i]==codes[a])&(code[j]==codes[b]))|((code[i]==codes[b])&(code[j]==codes[a]))
             cls[use]=q.class_id.iloc[k]
         z=null[null.band.eq(band)].sort_values("observed_days")
+        # star null as a plate systematic, zero for CCD-CCD pairs
         systematic=np.interp(np.log10(np.maximum(observed,1)),np.log10(z.observed_days),z.sf2_after)*w
         systematic[(code[i]==0)&(code[j]==0)]=0.
         weights=np.zeros((3,esf.NB,draws.shape[1]));moments=np.full((3,esf.NB),np.nan);shift=moments.copy()
+        # all pairs, brightening, dimming (asymmetry check)
         for sign,use in enumerate((np.ones(len(dm),bool),dm<0,dm>0)):
             count=np.bincount(bins[use],minlength=esf.NB)
             moments[sign]=np.divide(np.bincount(bins[use],weights=moment[use],minlength=esf.NB),count,out=np.full(esf.NB,np.nan),where=count>0)
@@ -698,17 +747,20 @@ def native_sed_impact():
             for k,obj in enumerate(prop.index.astype(str)):
                 g=nightly[nightly.OBJID.eq(obj)&nightly.band.eq(band)].copy()
                 q=epochs.reindex(pd.MultiIndex.from_arrays([g.loc[g.sss,"OBJID"],g.loc[g.sss,"band"],g.loc[g.sss,"plate"]]))
+                # plate mags with each quasar's own SED term instead of the composite
                 terms=control.reindex(pd.MultiIndex.from_arrays([q.index.get_level_values(0),q.native]))[column]
                 if terms.isna().any():continue
                 pogson=q.native_mag.to_numpy()+q.sed_term.to_numpy()+terms.to_numpy()
                 softening=9e-11 if band=="g" else 1.2e-10
                 g.loc[g.sss,"mag"]=-2.5/np.log(10)*(np.arcsinh(10**(-.4*pogson)/(2*softening))+np.log(softening))
+                # same pairs, only the SED term differs
                 alternative=esf.accumulate(g,np.array([obj]),prop.z,edges=esf.EDGES[:nb+1],bands=[band],resid=True)[0,0]
                 np.testing.assert_array_equal(alternative[:,0],acc[k,:,0])
                 valid.append(k);alternatives.append(esf.object_second_moments(alternative[None])[0])
             if not valid:continue
             base=esf.object_second_moments(acc[np.array(valid)]);alternative=np.array(alternatives)
             point=np.sqrt(base.mean(axis=0));other=np.sqrt(alternative.mean(axis=0))
+            # paired quasar bootstrap (sample noise cancels in the difference)
             w=rng.multinomial(len(valid),np.full(len(valid),1/len(valid)),size=800)
             delta=np.sqrt(np.maximum(w@alternative/len(valid),0))-np.sqrt(np.maximum(w@base/len(valid),0))
             bounds=np.percentile(delta,[16,84],axis=0)

@@ -42,6 +42,7 @@ def blazars(cat):
 def catalog():
     cat = pd.read_parquet(DATA / "S82/Catalog.parquet")
     cat["z"] = redshifts()[cat.objectId.astype(str)].to_numpy()
+    # drop Roma-BZCAT blazars (Massaro et al. 2015) before any curve or sample
     cat = cat[~cat.objectId.astype(str).isin(blazars(cat).OBJID)]
     cat["OBJID"] = cat["objectId"].astype(str)
     cat["query_key"] = [f"{ra:.6f}_{dec:.6f}" for ra, dec in zip(cat.RA, cat.DEC)]
@@ -59,11 +60,13 @@ def inputs():
     lc = pd.read_parquet(DATA / "S82/total_lightcurves.parquet",
                          filters=[("band", "in", ["g", "r"])])
     lc["OBJID"] = lc.OBJID.astype(str)
+    # CCD nightly means per survey (counts give sampling, means the selection mag)
     modern = lc.loc[~lc.survey.str.startswith("sss")].copy()
     modern["night"] = np.floor(modern.time).astype(np.int64)
     nights = modern.groupby(["OBJID", "band", "survey", "night"], observed=True).mag.mean()
     stats = nights.groupby(["OBJID", "band", "survey"]).agg(["mean", "median", "count"]).reset_index()
     band = {filters[b]: b for b in "gr"}
+    # SDSS nights from raw photometry (MacLeod et al. 2012 covers only some quasars)
     raw = pd.read_parquet(DATA / "S82/dr16s82_sdssLCRaw.parquet", columns=["objectId", "mjd", "psMag", "filterID"],
                           filters=[("filterID", "in", list(band))])
     sdss = raw.psMag.astype(float).groupby([raw.objectId.astype(str).rename("OBJID"), raw.filterID.map(band).rename("band"),
@@ -75,6 +78,7 @@ def inputs():
     sdss.update(macleod)
     stats = pd.concat([stats[stats.survey != "sdss"], sdss.reset_index().assign(survey="sdss")]).sort_values(
         ["OBJID", "band", "survey"], ignore_index=True)
+    # selection mag from CCD means only, independent of the plates
     ref = stats.groupby(["OBJID", "band"])["mean"].mean().unstack().reindex(cat.OBJID)
     original_median = modern.groupby(["OBJID", "band"]).mag.median()
     plates = lc.loc[lc.survey.str.startswith("sss")].copy()
@@ -82,9 +86,11 @@ def inputs():
 
 
 def opportunities(cat, prop, ref, plates):
+    # Stripe 82 parent of the plate archive query
     parent = prop[((prop.RA > 300) | (prop.RA < 60)) & (prop.DEC > -1.3) & (prop.DEC < 1.3)]
     query_keys = set(f"{ra:.6f}_{dec:.6f}" for ra, dec in zip(parent.RA, parent.DEC))
     key_index = dict(zip(cat.query_key, cat.index))
+    # nearest archive detection per plate, the first recovery stage
     raw = []
     with h5py.File(DATA / "wu_qso.hdf5") as h:
         seen_keys = set(h)
@@ -100,6 +106,7 @@ def opportunities(cat, prop, ref, plates):
             raw.extend((k, int(pl), float(dd)) for pl, dd in zip(a["plateID"], sep))
     raw = pd.DataFrame(raw, columns=["parent_index", "plate", "separation_arcsec"])
     raw = raw.groupby(["parent_index", "plate"]).separation_arcsec.min()
+    # group-centroid catalog match, the second recovery stage
     groups = assign_group_ids_by_sky(sss_raw())
     mapping = match_groups_to_catalog(groups, str(DATA / "S82/Catalog.parquet"))
     matched = groups.drop(columns=["OBJID", "z"], errors="ignore").merge(mapping, on="GROUP_ID")
@@ -107,6 +114,7 @@ def opportunities(cat, prop, ref, plates):
     kept = set(zip(plates.OBJID, plates.plate.astype(int)))
     flagged = set(zip(plates.loc[~plates.calib_ok, "OBJID"], plates.loc[~plates.calib_ok, "plate"].astype(int)))
     rows = []
+    # quasars inside each plate's calibrated area
     for p, k, edge in footprint(cat, pd.read_csv(DATA / "plate_native_calibration.csv", float_precision="round_trip")):
         ind = pd.MultiIndex.from_arrays([k, np.full(len(k), p.plate)])
         sep = raw.reindex(ind).to_numpy()
@@ -121,6 +129,7 @@ def opportunities(cat, prop, ref, plates):
                                   "quality_flagged": [(o, p.plate) in flagged for o in obj]}))
     out = pd.concat(rows, ignore_index=True)
     out.to_parquet(DATA / "plate_completeness_opportunities.parquet", index=False)
+    # require a complete archive query (unqueried quasars would count as misses)
     notebook = json.loads((ROOT / "src/query.ipynb").read_text())
     outputs = "".join("".join(o.get("text", [])) for c in notebook["cells"] for o in c.get("outputs", []))
     if "39827/39827" not in outputs:
@@ -146,6 +155,7 @@ def footprint(cat, zp):
     ctr = plate_centers()
     for p in zp[zp.survey.isin(SERIES)].itertuples():
         xi, eta = field_coords(np.full(len(cat), p.plate), cat.RA.to_numpy(), cat.DEC.to_numpy(), ctr)
+        # edge distance for the 0.02 deg inset approximating real plate coverage
         edge = np.minimum.reduce([xi-p.xi_lo, p.xi_hi-xi, eta-p.eta_lo, p.eta_hi-eta])
         k = np.flatnonzero(edge >= 0)
         yield p, k, edge[k]
@@ -167,7 +177,9 @@ def binned_curve(mag, value, keep, width=0.25, min_n=20, start=18.5, level=0.9, 
             rows.append((0.5*(lo+hi), int(k.sum()), float(value[k].mean()),
                          float(value[k].std(ddof=1)/np.sqrt(k.sum()))))
     a = np.array(rows)
+    # non-increasing PAVA fit (completeness falls toward faint mags)
     fit = _pava_decreasing(np.clip(a[:, 2], 0, 1), a[:, 1]) if monotone else np.clip(a[:, 2], 0, 1)
+    # limit at the first bin past start below level, interpolated
     below = np.flatnonzero((a[:, 0] > start) & (fit < level))
     if not len(below):
         return a, fit, np.inf
@@ -178,10 +190,12 @@ def binned_curve(mag, value, keep, width=0.25, min_n=20, start=18.5, level=0.9, 
 def band_statistics(cat, stats, ref, interior, band, k=25, window=(17.75, 18.75)):
     mag = ref[band].to_numpy()
     co = np.column_stack([(cat.RA.to_numpy()+180) % 360-180, cat.DEC])
+    # plate recovery vs mean CCD mag (90% crossing enters the faint cut)
     group = interior[interior.series == PRIMARY[band]].groupby("OBJID")
     inside = cat.OBJID.isin(group.size().index).to_numpy()
     detected = group.kept_epoch.any().reindex(cat.OBJID).fillna(False).to_numpy(bool)
     values = {PRIMARY[band]: (detected.astype(float), inside)}
+    # relative CCD sampling, nights over those of 25 nearby bright quasars
     for name in ("sdss", "ps1", "ztf"):
         n = stats[(stats.band == band) & (stats.survey == name)].set_index("OBJID")["count"].reindex(cat.OBJID).fillna(0).to_numpy()
         bright = (mag >= window[0]) & (mag < window[1]) & (n > 0)
@@ -217,13 +231,16 @@ def sample_tables(cat, stats, ref, opp):
                 curves.append(dict(band=band, survey=name, mag_center=row[0], n_objects=int(row[1]),
                                    recovery=row[2], recovery_err=row[3], monotone_recovery=fitted,
                                    limit90=limit, kind=levels[-1]["kind"], stage="kept_epoch"))
+        # faint cuts 0.25-1.25 mag brighter than the plate or overall 90% limit
         cuts = [(f"{kind}_cut_{int(100*margin):03d}", margin, limit-margin) for margin in MARGINS
                 for kind, limit in [("plate", limits[0]), ("all", min(limits))]]
         for name, margin, faint in cuts + [("all_nocut", np.nan, np.inf), ("all_lim050", np.nan, min(limits50)),
                                            ("all_cut_000", 0.0, min(limits)), ("all_lim095", np.nan, min(limits95))]:
+            # primary-series footprint, z >= 0.5 (host light), 17.5 mag bright cut
             keep = inside & target & (mag >= BRIGHT_BOUND) & (mag <= faint)
             if name == ADOPTED_SELECTION[band]:
                 out["magnitude_selected"] = keep
+            # drop |Z_SYS - Z_DR16Q| >= 0.2 after magnitude_selected (wrong rest-frame lags)
             keep = keep & ~cat.redshift_mismatch.to_numpy()
             out[name] = keep
             row = dict(band=band, selection=name, margin_mag=margin,
@@ -236,6 +253,7 @@ def sample_tables(cat, stats, ref, opp):
         out["plate_limit90"], out["ccd_limit90"] = limits[0], min(limits[1:])
         out["adopted_keep"] = False
         all_rows.append(out)
+    # recovery per matching stage
     for sv, band in SERIES.items():
         g = interior[interior.series == sv]
         for weighting in ("object", "opportunity"):
@@ -262,6 +280,7 @@ def correction_components(original_median):
     raw = raw[raw.objectId.isin(cat.objectId)].assign(OBJID=lambda d: d.objectId.astype(str), survey="sdss")
     reference = ccd_reference_mags()
     rows = []
+    # shift removing the modeled CCD selection correction at each reference mag
     for (sv, band), g in ccd_truncation_curve().groupby(["survey", "band"]):
         if band not in "gr":
             continue
@@ -276,6 +295,7 @@ def correction_components(original_median):
                                      filters=[("survey", "==", "sdss"), ("band", "==", band)]).groupby("OBJID").mag.median().reindex(cat.OBJID).to_numpy()
             if np.nanmax(np.abs(before-after-shift)) > 1e-9:
                 raise ValueError("CCD correction reversal does not reproduce raw SDSS medians")
+    # zero shift for plate epochs (no selection correction)
     for band, survey in (("g", "sss"), ("r", "sss"), ("r", "sss_possi")):
         rv = original_median.reindex(pd.MultiIndex.from_arrays([cat.OBJID, np.repeat(band, len(cat))])).to_numpy()
         rows.append(pd.DataFrame({"OBJID": cat.OBJID, "band": band, "survey": survey,
@@ -314,6 +334,8 @@ def cut_recovery_stages(sample, opp):
     sweep.to_csv(DATA / "plate_completeness_cut_sweep.csv", index=False)
 
 
+# SF light curves without shallow ZTF epochs (Arevalo et al. 2023)
+# remove_dropout undoes the modeled CCD selection correction
 def load_completeness_lightcurves(objids=None, remove_dropout=True):
     filters = [("band", "in", ["g", "r"])]
     if objids is not None:
@@ -353,6 +375,7 @@ def _property_weights(features, cells, selected, counts, target, theta=None):
     log_count = np.log(counts[active])
     parts = [np.flatnonzero(c == j) for j in range(len(cell_mass))]
 
+    # entropy-balancing weights through the convex dual
     def objective(coef, weights_only=False):
         weights = np.zeros(len(x))
         value = -coef @ goal
@@ -380,6 +403,7 @@ def accumulator_signature(ids):
     import inspect
     import ensemble_structure_function as esf
 
+    # cache key over inputs, quasars, redshifts and kernel source
     h = hashlib.sha256()
     for p in [esf.LC_PARQUET, "data/detection_correction_components.parquet", "data/plate_native_pair_variance.csv"]:
         h.update(esf.digest(ROOT / p).encode())
@@ -407,6 +431,7 @@ def property_support(a, s, x, size=0.5, minimum=5):
     covered = (a[..., 0] > 0).all(axis=1)
     masks = np.stack([covered & s[n].fillna(False).to_numpy(bool) for n in names], axis=1)
     valid = np.isfinite(x).all(axis=1)
+    # 0.5 dex mass-Eddington cells filled under every cut
     cell = np.floor(np.nan_to_num((x-[6, -5])/size)).astype(int) @ [100, 1]
     occupancy = np.stack([np.bincount(cell[m & valid], minlength=cell.max()+1) for m in masks.T])
     common = np.flatnonzero(occupancy.min(axis=0) >= minimum)
@@ -420,12 +445,14 @@ def controlled(a, s, x, z, bi, n_boot, size=0.5, minimum=5, redshift=False, cont
     names, masks, valid, cell, common = property_support(a, s, x, size, minimum)
     if control and not len(common):
         raise ValueError("no property cell holds the minimum under every cut")
+    # reweight every cut to the brightest cut's properties
     take = masks[:, 0] & valid & np.isin(cell, common) if control else masks[:, 0]
     ix = np.flatnonzero(take)
     c = np.searchsorted(common, cell[ix])
     mm = masks[ix]
     target = mm[:, -1]
     prop = np.column_stack([x, z])[ix] if redshift else x[ix]
+    # balance means, variances and the mass-Eddington product
     standardized = (prop-prop[target].mean(axis=0))/prop[target].std(axis=0)
     features = np.column_stack([standardized, standardized**2, standardized[:, 0]*standardized[:, 1]])
     values = esf.object_second_moments(a[ix])
@@ -435,6 +462,7 @@ def controlled(a, s, x, z, bi, n_boot, size=0.5, minimum=5, redshift=False, cont
     reps = np.empty((n_boot, len(names), a.shape[1]))
     rng = np.random.default_rng(928+bi)
     max_error = 0.0
+    # weights refit in every draw (their uncertainty enters the errors)
     for b in range(n_boot):
         counts = rng.multinomial(len(ix), np.full(len(ix), 1/len(ix))).astype(float)
         for j in range(len(names)):
@@ -450,6 +478,7 @@ def controlled(a, s, x, z, bi, n_boot, size=0.5, minimum=5, redshift=False, cont
 
 
 def max_t(point, reps, j, others, long):
+    # max |t| over all long-lag bins (one test for many bins)
     delta = reps[:, j, long][:, None]-reps[:, others][:, :, long]
     se = delta.std(axis=0, ddof=1)
     null = np.max(np.abs((delta-delta.mean(axis=0))/se), axis=(1, 2))
@@ -469,6 +498,7 @@ def candidate_sample():
 
 
 def band_inputs(ids, acc, sample, bi):
+    # bins up to the fiducial final bin (few pairs beyond)
     return acc[:, bi, :13 if bi == 0 else 14], sample[sample.band.eq("gr"[bi])].set_index("OBJID").reindex(ids)
 
 
@@ -479,6 +509,7 @@ def expand(a):
 def fixed_members(a, s, band):
     import ensemble_structure_function as esf
 
+    # same quasars in every bin for each sample, as for the fiducial
     fixed = np.stack([(a[..., 0] > 0).all(axis=1) & s[n].fillna(False).to_numpy(bool) for n in DIAGNOSIS], axis=1)
     use = fixed.any(axis=1)
     ids = s.index.to_numpy(str)[use]
@@ -490,6 +521,7 @@ def sf_ratios(r, fid):
     import ensemble_structure_function as esf
 
     long = np.flatnonzero(esf.CENTERS[:r.shape[-1]] >= 2371)
+    # each sample's SF over the fiducial, short lags and from 2371 d
     return {k: np.exp(np.log(r[..., i]/r[..., i][..., [fid], :]).mean(axis=-1)/2) for k, i in (("short", SHORT), ("long", long))}
 
 
@@ -503,12 +535,15 @@ def fixed_diagnosis(a, s, x, band, n_common, n_boot, seed):
     sf2 = esf.ensemble_second_moment(expanded, weights=fixed[..., None].astype(float))
     reps = esf.object_bootstrap(expanded, n_boot=n_boot, seed=seed, weights=fixed[..., None].astype(float))[1]
     mean = lambda v, m=fixed: (np.nan_to_num(v).T @ m/m.sum(axis=0)).T
+    # noise share of SF^2 at short lags
     noise = mean((a[:, SHORT, 2]-a[:, SHORT, 4])/a[:, SHORT, 0])/sf2[:, SHORT]
     share = {}
+    # each CCD survey's share of short-lag pair epochs (unit errors on that survey)
     for sv in ("sdss", "ps1", "ztf"):
         b = esf.accumulate(nt.assign(mag=0., sig=nt.survey.eq(sv).astype(float)), ids, s.z, bands=[band])[:, 0, SHORT]
         np.testing.assert_array_equal(b[..., 0], a[:, SHORT, 0])
         share[sv] = mean(b[..., 2]/(2*b[..., 0])).mean(axis=1)
+    # expected SF ratio from MacLeod et al. 2010 DRW scalings
     lum = s.loglbol.where(s.loglbol > 0).to_numpy()
     logf = np.column_stack(macleod_drw(POPDRW_COEF, band, s.z.to_numpy(), 90-2.5*lum, x[:, 0]))
     logf -= np.nanmean(logf, axis=0)
@@ -551,6 +586,7 @@ def property_control(n_boot=2000):
         prop = x[ix]
         for j, name in enumerate(names):
             w, coef, error = r["fits"][j]
+            # property moments per weighting step (balance check)
             for stage, use, ww in [("unweighted", masks[:, j], None),
                                    ("common_support", take & masks[:, j], None),
                                    ("property_control", take, w)]:
@@ -582,6 +618,7 @@ def property_control(n_boot=2000):
         for j, name in enumerate(names):
             old = native[native.band.eq(band) & native.selection.eq(name)].sort_values("lag_center_days")
             current = _object_amplitude(esf.ensemble_second_moment(a[masks[:, j]]))
+            # unweighted SF must equal the completeness sweep
             if not np.allclose(old.sf_mag, current, rtol=1e-10, atol=1e-10):
                 raise ValueError(f"{band} {name}: current moments differ from native sweep")
             w = r["fits"][j][0]
@@ -592,6 +629,7 @@ def property_control(n_boot=2000):
                                  n_objects=int(mm[:, j].sum()), effective_n=1/(w @ w),
                                  n_common_cells=len(common), bootstrap_draws=n_boot,
                                  maximum_bootstrap_balance_residual=r["max_error"]))
+            # reweighted SF against each brighter cut, as in the adoption rule
             for l in range(j+1, len(names)):
                 statistic, threshold, p, delta, se = max_t(point, reps, j, [l], long)
                 checks.append(dict(band=band, selection=name, comparison=names[l],

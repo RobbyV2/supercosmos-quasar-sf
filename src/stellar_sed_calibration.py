@@ -14,6 +14,7 @@ import assemble_lightcurves as al
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 WORK = ROOT / "temp/calibration_sed_model"
+# SDSS to AB offsets and errors per ugriz (Thanjavur et al. 2021)
 AB_OFFSET = np.array([0., 0., .015, .016, .035])
 AB_ERROR = np.array([.019, .014, .004, .004, .011])
 ASINH_B = np.array([1.4, .9, 1.2, 1.8, 7.4]) * 1e-10
@@ -25,6 +26,7 @@ BJ_RESPONSE_POWER = 1.5
 PASSBAND_URLS = dict(
     parker="https://www.cambridge.org/core/services/aop-cambridge-core/content/view/878CF0C11CE7BC44BCA9294637F46981/S132335800000597Xa.pdf/the-introduction-of-tech-pan-film-at-the-uk-schmidt-telescope.pdf",
     schott="https://www.schott.com/-/media/project/onex/products/o/optical-filter-glass/downloads/schott-datasheet-collection-filter-en_112019.pdf?rev=766d730fb2ac41fd82165f3f74ee7ae3")
+# Parker & Malin 1999 Fig. 1 frame x edges (4500 and 7500 A)
 PARKER_X = (133.2550048828125, 499.0790100097656)
 PASSBANDS = dict(  # Parker & Malin 1999 Fig. 1 curve drawing, line items, frame drawing/item, frame bottom/top, printed nodes
     techpan=(7, slice(24, 50), (0, 0), 254.3599853515625, 98.00897216796875, False,
@@ -43,6 +45,7 @@ def redden(wave: np.ndarray, flux: np.ndarray, ebv: float) -> np.ndarray:
 
 
 def catalog_to_ab(mag: np.ndarray, error: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # asinh mags (Lupton et al. 1999) to AB, with errors
     arg = -mag * np.log(10.) / 2.5 - np.log(ASINH_B)
     with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
         flux = 2. * ASINH_B * np.sinh(arg)
@@ -59,6 +62,7 @@ def star_inputs() -> pd.DataFrame:
     cat = pd.read_csv(DATA / "stripe82calibStars_v4.2.dat", sep=r"\s+", comment="#",
                       header=None, usecols=[1, 2, 6] + list(range(7, 37)))
     sky = SkyCoord(ra=pos[:, 0] * u.deg, dec=pos[:, 1] * u.deg)
+    # median ugriz from the nearest catalog star (Thanjavur et al. 2021)
     idx, sep, _ = sky.match_to_catalog_sky(SkyCoord(ra=cat[1].to_numpy() * u.deg,
                                                    dec=cat[2].to_numpy() * u.deg))
     cat = cat.iloc[idx].reset_index(drop=True)
@@ -69,10 +73,12 @@ def star_inputs() -> pd.DataFrame:
     good = (sep.arcsec <= 1.) & out.ebv.between(0., EBV[-1]).to_numpy()
     for i, band in enumerate("ugriz"):
         start = 7 + 6 * i
+        # median error = 1.25 x msig (error of the mean)
         out[band] = cat[start + 1]
         out[f"{band}_err"] = 1.25 * cat[start + 3]
         out[f"{band}_n"] = cat[start]
         good &= out[band].between(10., 30.).to_numpy() & (out[f"{band}_err"] > 0.)
+        # catalog reliability cuts, >= 4 epochs and gri msig sqrt(Nobs) < 0.03
         good &= cat[start] >= 4
         if band in "gri":
             good &= cat[start + 3] * np.sqrt(cat[start]) < .03
@@ -93,6 +99,7 @@ def _weights(wave: np.ndarray, wf: np.ndarray, tf: np.ndarray) -> np.ndarray:
     weights = trans * lam * step
     weights[[0, -1]] *= .5
     weights /= al._F0_AB * al._C_AA * np.trapezoid(trans / lam, lam)
+    # filter weights on the model wavelength grid, shared by all models
     ix = np.searchsorted(wave, lam) - 1
     frac = (lam - wave[ix]) / (wave[ix + 1] - wave[ix])
     return (np.bincount(ix, weights * (1. - frac), minlength=len(wave))
@@ -126,6 +133,7 @@ def model_grid(energy: bool = False, og590: bool = False, bj_factor: bool = Fals
     wave = wave[keep]
     flux = np.array([np.loadtxt(DATA / "bosz" / r["file"])[keep, 0] for r in manifest])
     filters = [al.read_bandpass(f) for f in BANDS.values()]
+    # alternative responses (OG590 red, energy counting or adopted B_J)
     if og590:
         filters[6] = al.read_bandpass("iiiaf_og590.txt")
     elif energy:
@@ -133,6 +141,7 @@ def model_grid(energy: bool = False, og590: bool = False, bj_factor: bool = Fals
     elif bj_factor:
         filters[5] = bj_response()
     weights = np.stack([_weights(wave, *f) for f in filters])
+    # Vega-based plate bands (Hambly et al. 2001), AB for SDSS
     vega = np.array([0.] * 5 + [al.ab_minus_vega(*f) for f in filters[5:]])
     ext = np.array([F99(Rv=3.1).extinguish(wave * u.AA, Ebv=e) for e in EBV])
     integrals = flux @ (ext[:, None, :] * weights[None, :, :]).reshape(-1, len(wave)).T
@@ -147,6 +156,7 @@ def model_grid(energy: bool = False, og590: bool = False, bj_factor: bool = Fals
 
 def dense_grid(params: np.ndarray, mags: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     p, m = [], []
+    # interpolate in Teff to 25 K steps at each logg and metallicity
     for gravity, metal in np.unique(params[:, 1:], axis=0):
         idx = np.flatnonzero((params[:, 1] == gravity) & (params[:, 2] == metal))
         idx = idx[np.argsort(params[idx, 0])]
@@ -161,6 +171,7 @@ def dense_grid(params: np.ndarray, mags: np.ndarray) -> tuple[np.ndarray, np.nda
 
 
 def _at_ebv(mags: np.ndarray, ebv: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    # linear interpolation in E(B-V) between grid nodes
     lo = np.minimum((ebv / .005).astype(int), len(EBV) - 2)
     frac = (ebv - EBV[lo]) / .005
     return mags[idx, lo[:, None]] * (1. - frac[:, None, None]) + mags[idx, lo[:, None] + 1] * frac[:, None, None]
@@ -172,7 +183,7 @@ def fit_stars(obs: np.ndarray, err: np.ndarray, ebv: np.ndarray, params: np.ndar
 
     Returns
         chi2 and model index, free magnitude offset fitted out
-        delta: catalog g or r minus native Vega B_J, R, E, TechPan, best model
+        delta: catalog g or r minus native Vega B_J, R, E, Tech Pan, best model
         delta_err: spread of delta over models, weights exp(-chi2/2)
         residual ugriz
     """
@@ -182,6 +193,7 @@ def fit_stars(obs: np.ndarray, err: np.ndarray, ebv: np.ndarray, params: np.ndar
                   residual=np.zeros((count, 5)))
     colors = obs[:, :-1] - obs[:, 1:]
     scale = np.array([.04, .02, .02, .025])
+    # shortlist models by nearest colors per 0.01 E(B-V) group
     group = np.rint(ebv / .01).astype(int)
     for g in np.unique(group):
         inds = np.flatnonzero(group == g)
@@ -195,17 +207,21 @@ def fit_stars(obs: np.ndarray, err: np.ndarray, ebv: np.ndarray, params: np.ndar
             red = gri.query(colors[ix, 1:] / scale[1:], k=candidates // 2, workers=1)[1]
             cand = np.sort(np.concatenate([full, red], axis=1), axis=1)
             duplicate = np.column_stack([np.zeros(len(ix), bool), np.diff(cand, axis=1) == 0])
+            # free magnitude offset per model (surface flux, unknown distance)
             pred = _at_ebv(mags, ebv[ix], cand)
             residual = obs[ix, None, :] - pred[:, :, :5]
             weight = 1. / err[ix] ** 2
             norm = np.sum(residual * weight[:, None, :], axis=2) / weight.sum(axis=1)[:, None]
             residual -= norm[:, :, None]
             chi = np.sum(residual ** 2 * weight[:, None, :], axis=2)
+            # models on both shortlists count once
             chi[duplicate] = np.inf
             best = np.argmin(chi, axis=1)
             minimum = chi[np.arange(len(ix)), best]
+            # exp(-chi2/2) model weights, their plate-color spread gives the error
             prob = np.exp(-.5 * np.minimum(chi - minimum[:, None], 150.))
             prob /= prob.sum(axis=1)[:, None]
+            # model color from catalog g or r to each plate band
             delta = pred[:, :, [1, 2, 2, 2]] - pred[:, :, 5:] - AB_OFFSET[[1, 2, 2, 2]]
             mean = np.sum(delta * prob[:, :, None], axis=1)
             result["chi2"][ix] = minimum
@@ -229,6 +245,7 @@ def run() -> None:
     ebv = table.ebv.to_numpy()[ok]
     print(f"Fitting {len(idx)} stars against {len(params)} interpolated spectra", flush=True)
     fixed = fit_stars(obs, errors, ebv, params, mags)
+    # Pogson minus asinh catalog g and r, taken out of the color terms
     correction = (obs - AB_OFFSET - table.loc[ok, list("ugriz")].to_numpy())[:, [1, 2, 2, 2]]
     for j, name in enumerate(["teff", "logg", "metallicity"]):
         table.loc[ok, name] = params[fixed["model"], j]
@@ -239,6 +256,7 @@ def run() -> None:
                                          | (params[fixed["model"]] == params.max(axis=0)), axis=1)
     for j, band in enumerate("ugriz"):
         table.loc[ok, f"{band}_residual"] = fixed["residual"][:, j]
+    # predicted plate magnitude per star, the calibration target
     native_names = ["bj", "r", "e", "tp"]
     delta_names = ["delta_g_bj", "delta_r_r", "delta_r_e", "delta_r_tp"]
     for j, (name, delta, ref) in enumerate(zip(native_names, delta_names, ["g", "r", "r", "r"])):
@@ -246,12 +264,14 @@ def run() -> None:
         table.loc[ok, f"{delta}_err"] = fixed["delta_err"][:, j]
         table[f"{name}_native"] = table[ref] - table[delta]
         table[f"{name}_native_err"] = np.hypot(table[f"{ref}_err"], table[f"{delta}_err"])
+    # good SED fits only (chi2 < 25, every residual < 0.1 mag)
     table["fit_ok"] = ok & (table.chi2 < SED_CHI2_MAX)
     table.loc[ok, "fit_ok"] &= np.max(np.abs(fixed["residual"]), axis=1) < .1
     _save(table)
     print(f"Fixed-column fits saved: {table.fit_ok.sum()} accepted", flush=True)
     best = {k: v.copy() for k, v in fixed.items()}
     best_ebv = ebv.copy()
+    # refit at 0-75% of E(B-V) (stars in front of some dust)
     for fraction in [0., .25, .5, .75]:
         alternative = fit_stars(obs, errors, fraction * ebv, params, mags)
         win = alternative["chi2"] < best["chi2"]
@@ -303,6 +323,7 @@ def native_response_sensitivity(og590: bool = False) -> None:
     out = (pd.read_parquet(response_path) if response_path.exists() else table[["star"]].copy()) if og590 else table
     ebv = table.loc[ok, "ebv"].to_numpy()
 
+    # response shifts at each star's fitted model and E(B-V)
     def shift(**grid: bool) -> np.ndarray:
         _, alternate = dense_grid(base_params, model_grid(**grid)[1])
         values = np.zeros((len(indices), 3))
@@ -312,6 +333,7 @@ def native_response_sensitivity(og590: bool = False) -> None:
             values[sl] = (_at_ebv(alternate, *args) - _at_ebv(primary, *args))[:, 0, 5:8]
         return values
 
+    # adopted OG590 red response (ugriz fits must repeat exactly)
     if og590:
         _, alternate, _ = model_grid(og590=True)
         _, alternate = dense_grid(base_params, alternate)
@@ -326,6 +348,7 @@ def native_response_sensitivity(og590: bool = False) -> None:
         out.loc[ok, "r_native_og590_err"] = np.hypot(table.loc[ok, "r_err"], result["delta_err"][:, 1])
         out.loc[ok, "bj_native_factor_shift"] = shift(bj_factor=True)[:, 0]
     else:
+        # energy-counting test (archival curves don't specify)
         values = shift(energy=True)
         for j, band in enumerate(("bj", "r", "e")):
             out.loc[ok, f"{band}_native_energy_shift"] = values[:, j]
@@ -349,6 +372,7 @@ def build_passbands(out: Path = DATA) -> None:
         if not (src / f"{name}.pdf").exists():
             urllib.request.urlretrieve(url, src / f"{name}.pdf")
         pdf[name] = pymupdf.open(src / f"{name}.pdf")
+    # OG590 3 mm transmission (SCHOTT AG 2019), zero below 550 nm
     words = pdf["schott"][91].get_text("words")
     schott = []
     for x0, y0, _, _, word, *_ in words:
@@ -356,20 +380,24 @@ def build_passbands(out: Path = DATA) -> None:
             value, = [a[4] for a in words if 170 < a[0] < 180 and abs(a[1] - y0) < .02]
             schott.append((float(word) * 10, 0. if int(word) < 550 else float(value.replace(",", "."))))
     schott = np.array(schott)
+    # emulsion curves from the Parker & Malin 1999 Fig. 1 vectors
     drawings = pdf["parker"][1].get_drawings()
     for name, (draw, items, (fd, fi), bottom, top, printed, header) in PASSBANDS.items():
         frame = drawings[fd]["items"][fi][1].rect
         seg = drawings[draw]["items"][items]
         x, y = np.array([seg[0][1]] + [z[2] for z in seg]).T
+        # stop on any change to the PDF layout
         if (len(schott) != 30 or len(seg) != items.stop - items.start or any(z[0] != "l" for z in seg)
                 or np.any(np.diff(x) <= 0) or not np.allclose([frame.x0, frame.x1, frame.y1, frame.y0],
                                                               [*PARKER_X, bottom, top], atol=.001)):
             raise ValueError(f"Parker & Malin or SCHOTT layout changed ({name})")
         wave, sens = 4500 + (x - PARKER_X[0]) * 3000 / (PARKER_X[1] - PARKER_X[0]), (bottom - y) / (bottom - top)
+        # IIIa-F nodes at printed precision (stored curve rebuilds exactly)
         if printed:
             wave, sens = np.char.mod("%.6f", wave).astype(float), np.char.mod("%.8f", sens).astype(float)
         grid = np.unique(np.r_[np.arange(5000., 7500.1, 10), wave[(wave >= 5000) & (wave <= 7500)],
                                schott[:, 0][schott[:, 0] <= 7500]])
+        # per-energy sensitivity over wavelength gives the photon response
         photon = np.interp(grid, wave, sens) * np.interp(grid, *schott.T, left=0, right=0) / grid
         np.savetxt(out / f"{name}_og590.txt", np.c_[grid, photon / photon.max()], fmt=["%.6f", "%.9f"], header=header)
 

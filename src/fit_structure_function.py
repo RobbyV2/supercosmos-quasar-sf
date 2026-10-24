@@ -26,6 +26,7 @@ def stone_grid():
     grid = np.asarray(row["DT_REST_g"], float)
     lgrid = np.log10(grid)
     lstep = float(np.median(np.diff(lgrid)))
+    # Stone et al. 2022 lists bin centers only, edges halfway in log lag
     edges = 10.0 ** np.concatenate([lgrid - lstep / 2, [lgrid[-1] + lstep / 2]])
     return grid, edges
 
@@ -56,6 +57,7 @@ def literature_choices(n_boot=2000):
     rows = []
     for b in BANDS:
         sf, dt = per[b]
+        # per-quasar SFs by Stone et al. 2022 node, testing estimators against their errors
         kid = np.rint((np.log10(dt) - lgrid[0]) / np.median(np.diff(lgrid))).astype(int)
         pub, err = (np.asarray(row[c], float) for c in (f"SF_{b}", f"SF_{b}_ERR"))
         for k in np.flatnonzero(np.isfinite(pub) & (grid >= STONE_FLOOR_END_D[b]) & (pub > 0)):
@@ -65,6 +67,7 @@ def literature_choices(n_boot=2000):
                              sf_err_mag=err[k], std_over_n_mag=v.std() / v.size,
                              std_over_sqrt_n_mag=v.std() / np.sqrt(v.size), half_width_mag=np.diff(boot)[0] / 2))
         tab = ours[ours.band.eq(b)].sort_values("lag_center_days")
+        # Stone et al. 2022 and MacLeod et al. 2012 points vs our same-lag bin
         for src, lag, lit, hw in [("stone", grid[k], pub[k], err[k]), ("macleod_poss1", mac.lag_center_days,
                                   mac.sf_mag, (mac.sf_hi_mag - mac.sf_lo_mag) / 2)]:
             o = tab.iloc[np.searchsorted(EDGES, lag) - 1]
@@ -72,11 +75,13 @@ def literature_choices(n_boot=2000):
                              our_lag_center_days=o.lag_center_days, our_lag_lo_days=o.lag_lo_days,
                              our_lag_hi_days=o.lag_hi_days, our_sf_mag=o.sf_mag,
                              our_half_width_mag=(o.sf_hi_mag - o.sf_lo_mag) / 2, n_objects=o.n_objects))
+        # our share at rest 2000-3000 A, the SDSS-POSS range (MacLeod et al. 2012)
         lam = POPDRW_LAM_OBS[b] / (1 + z[b])
         rows.append(dict(kind="rest_wavelength", band=b, n_objects=lam.size, lam_obs_angstrom=POPDRW_LAM_OBS[b],
                          lam_rest_median_angstrom=np.median(lam), lam_rest_q16_angstrom=np.percentile(lam, 16),
                          lam_rest_q84_angstrom=np.percentile(lam, 84), frac_2000_3000=np.mean(
                              (lam >= mac.wavelength_lo_angstrom) & (lam <= mac.wavelength_hi_angstrom))))
+    # Stone et al. 2022 quasars in our catalog, for Eddington-ratio medians
     cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet", columns=["objectId", "RA", "DEC"])
     match, separation, _ = stone_coords.match_to_catalog_sky(
         SkyCoord(cat.RA.to_numpy() * u.deg, cat.DEC.to_numpy() * u.deg))
@@ -114,6 +119,7 @@ def bootstrap_plan(band, name):
 
 
 def macleod_drw(coef, band, z, mi, logmbh):
+    # MacLeod et al. 2010 SF_inf and tau scalings with wavelength, M_i and mass
     x = np.column_stack([np.ones(len(z)), np.log10(POPDRW_LAM_OBS[band]/(1+np.asarray(z))/4000),
                          np.asarray(mi)+23, np.asarray(logmbh)-9])
     return [x @ np.asarray(coef[c]) for c in ("sfinf", "tau")]
@@ -135,6 +141,7 @@ def _object_amplitude(v):
 
 
 def _object_summary(a, z, lum, n_boot=5000, seed=31, weights=None):
+    # root after averaging (negative noise-dominated SF^2 stay in)
     v = esf.ensemble_second_moment(a, weights=weights)
     bounds, reps = esf.object_bootstrap(a, n_boot=n_boot, seed=seed, weights=weights)
     sf, limits, samples = (_object_amplitude(x) for x in (v, bounds, reps))
@@ -192,6 +199,7 @@ def _object_rises(a, reps, name, band):
     k0 = int(np.argmin(abs(CENTERS[:len(sf)]-2371)))
     rise = []
     for k in np.flatnonzero(CENTERS[:len(sf)] > LONG_MIN_D):
+        # paired draws for the rise (both bins share quasars)
         diff = reps[:, k]-reps[:, k0]
         lo, hi = np.percentile(diff, [16, 84])
         rise.append(dict(sample=name, band=band, lag_center_days=CENTERS[k],
@@ -211,8 +219,10 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
         s = sample[sample.band.eq(band)].set_index('OBJID').reindex(ids)
         a = acc[:,bi]
         endpoint = 12 if band == 'g' else 13
+        # each cut keeps the same quasars in every bin
         covered = (a[:,:endpoint+1,0]>0).all(axis=1)
         masks = np.stack([s[c].fillna(False).to_numpy(bool)&covered for c in candidates],axis=1)
+        # one weighted pass with shared draws (paired cut differences)
         expanded = np.broadcast_to(a[:,None,:endpoint+1],(len(a),len(candidates),endpoint+1,6))
         w = np.broadcast_to(masks[:,:,None],expanded.shape[:-1]).astype(float)
         point = esf.ensemble_second_moment(expanded, weights=w)
@@ -225,6 +235,7 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
                 rows.append(dict(band=band,selection=name,lag_center_days=CENTERS[k],n_fixed=int(use.sum()),
                                  sf_mag=pointsf[c,k],sf_lo_mag=bounds[0,c,k],sf_hi_mag=bounds[2,c,k],
                                  median_z=float(np.nanmedian(z[use])),median_loglbol=float(np.nanmedian(lum[use]))))
+        # differences within plate cuts and within all cuts, extra samples against all_cut_025
         pairs = [(i,j) for i in range(10) for j in range(i+1,10) if candidates[i].split('_')[0]==candidates[j].split('_')[0]]
         for ci,cj in pairs+[(i,5) for i in range(10,len(candidates))]:
             delta = reps[:,ci]-reps[:,cj]
@@ -234,6 +245,7 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
                                     difference_mag=pointsf[ci,k]-pointsf[cj,k],difference_lo_mag=q[0],
                                     difference_hi_mag=q[1],difference_se_mag=delta[:,k].std(ddof=1),
                                     n_fixed=int(masks[:,ci].sum()),n_comparison=int(masks[:,cj].sum()),bootstrap_draws=n_boot))
+        # equal weight per shared z-L cell (depth differs, not z-L mix)
         full=masks[:,5]
         ze=np.quantile(z[full],[0,.5,1])
         le=np.quantile(lum[full],[0,.5,1])
@@ -251,6 +263,7 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
                     matched_rows.append(dict(band=band,selection=name,lag_center_days=CENTERS[k],
                                              sf_mag=mpoint[c,k],sf_lo_mag=mbounds[0,c,k],sf_hi_mag=mbounds[2,c,k],
                                              n_objects=int((mw[:,c,k]>0).sum()),n_shared_cells=int(target.sum())))
+        # normalized at 2371 d to compare shapes
         anchor=int(np.argmin(abs(CENTERS[:endpoint+1]-2371)))
         normalized=pointsf/pointsf[:,anchor,None]
         nreps=reps/reps[:,:,anchor,None]
@@ -263,6 +276,7 @@ def _object_completeness_sweep(acc, ids, sample, z, lum, outdir, n_boot=10000):
                                            lag_center_days=CENTERS[k],ratio_difference=normalized[ci,k]-normalized[cj,k],
                                            difference_lo=q[0],difference_hi=q[1],difference_se=delta[:,k].std(ddof=1)))
         checks=[]
+        # adoption rule, agree with every brighter cut of >= 50 quasars at long lags
         for ci,others in [*((c,range(c+1,10)) for c in range(5,8)),(10,[5]),(11,[5]),(12,range(5,10)),(13,[5])]:
             all_stable=True
             for cj in others:
@@ -307,6 +321,7 @@ def object_first_results():
     cats=sample[sample.band.eq('g')].set_index('OBJID').reindex(ids)
     z,lum=cats.z.to_numpy(float),cats.loglbol.to_numpy(float)
     zmap=pd.Series(z,index=ids)
+    # cached pair sums, rebuilt on any input change, resumable per chunk
     signature=accumulator_signature(ids)
     cache=output/'object_accumulator.npz'
     completed=0
@@ -333,6 +348,7 @@ def object_first_results():
         s=sample[sample.band.eq(band)].set_index('OBJID').reindex(ids)
         available=s[adopted[band]].fillna(False).to_numpy(bool)
         endpoint=12 if band=='g' else 13
+        # same quasars in every bin keeps the SF shape sample-independent
         keep=available&(acc[:,bi,:endpoint+1,0]>0).all(axis=1)
         a=acc[keep,bi,:endpoint+1]
         oid=ids[keep]
@@ -341,11 +357,13 @@ def object_first_results():
         table['band']=band
         table['selection']=adopted[band]
         nt=esf.clean_nightly(load_completeness_lightcurves(oid).query('band == @band'))
+        # implied z_max (longest span just reaches the final bin)
         nights=nt.groupby('OBJID').time
         span,edge=(nights.max()-nights.min()).max(),EDGES[endpoint]
         redshift.append(dict(band=band,n=len(oid),z_min=z[keep].min(),z_median=np.median(z[keep]),z_max=z[keep].max(),
                              final_bin_lower_edge_days=edge,max_observed_separation_days=span,implied_z_max=span/edge-1))
         rows.append(table)
+        # pair lags per bin for models at the mean lag, counts must match
         kernel=_object_lag_kernel(nt,oid,zmap,a.shape[1])
         np.testing.assert_array_equal(kernel[2],a[...,0])
         rises+=_object_rises(a,reps,'fixed',band)
@@ -354,11 +372,13 @@ def object_first_results():
         selected[band]=(a,oid,z[keep],lum[keep],adopted[band])
         for key,value in zip(['nodes','weights','counts'],kernel):
             bootstrap_outputs[f'lag_{key}_{band}']=value
+        # pooled (as Sesar et al. 2006) and median estimators, for comparison
         for method in ['object_mean','pooled','object_median','positive_median']:
             v=esf.ensemble_second_moment(a,method=method)
             for k in range(endpoint+1):
                 comparisons.append(dict(band=band,sample='fixed',method=method,lag_center_days=CENTERS[k],
                                         sf2_mag2=v[k],sf_mag=np.sqrt(max(v[k],0)),n_objects=len(a)))
+        # 2500 vs 5000 draws, a convergence check on the bounds
         conv=np.percentile(reps[:2500],[16,84],axis=0)
         full=np.percentile(reps,[16,84],axis=0)
         print(f'{band}: {len(a)} fixed objects, through {CENTERS[endpoint]:.0f} d; SF {table.sf_mag.iloc[-1]:.4f} '
@@ -384,12 +404,14 @@ def _object_groups(selected, output, rises):
     ids=np.unique(np.concatenate([v[1] for v in selected.values()]))
     properties=esf.load_properties(ids).reindex(ids)
     valid=properties.notna().all(axis=1)
+    # median splits over both bands combined (shared g and r boundaries)
     edges={n:np.quantile(properties.loc[valid,n],[0,.5,1]) for n in ['LOGMBH','LOGLEDD_RATIO']}
     records,grid_records,matching=[],[],[]
     for band in BANDS:
         acc,oid,z,lum,_=selected[band]
         p=properties.reindex(oid)
         good=p.notna().all(axis=1).to_numpy()
+        # z-L cells with >= 5 quasars in every group, equal weight per cell
         cell,ncell=_cell_index(z,lum,2)
         masks={f'{ml}_{el}':good & mm & em
                for ml,mm in [('lowmbh',p.LOGMBH.to_numpy()<edges['LOGMBH'][1]),
@@ -429,6 +451,7 @@ def _object_groups(selected, output, rises):
                 tab['z_med_matched'],tab['logl_med_matched']=matched.z_med,matched.logl_med
             rises+=_object_rises(a,reps,name,band)
             records.append(tab)
+        # tercile grid, cells of >= 20 quasars
         me=np.quantile(properties.loc[valid,'LOGMBH'],np.linspace(0,1,4))
         ee=np.quantile(properties.loc[valid,'LOGLEDD_RATIO'],np.linspace(0,1,4))
         for i in range(3):
@@ -463,6 +486,7 @@ def object_first_refit():
     with np.load(output/'ensemble_sf_covariance.npz') as f:
         boot={k:f[k] for k in f.files}
     selected,available,rises={},{},[]
+    # stored members and draws (refit skips the accumulation)
     for bi,band in enumerate(BANDS):
         oid=boot[f'objids_{band}'].astype(str)
         indices=pd.Index(ids).get_indexer(oid)
@@ -474,6 +498,7 @@ def object_first_refit():
         selected[band]=(a,oid,z[indices],lum[indices],ADOPTED_SELECTION[band])
     _object_groups(selected,output,rises)
     pd.DataFrame(rises).to_csv(output/'structure_function_object_rises.csv',index=False)
+    # median z per bin for varying membership
     rows=[dict(band=band,lag_center_days=c,n_objects=int(u.sum()),z_med=np.median(z[u]) if u.any() else np.nan)
           for bi,band in enumerate(BANDS) for c,u in zip(CENTERS,(available[band][:,None]&(acc[:,bi,:,0]>0)).T)]
     pd.DataFrame(rows).to_csv(output/'structure_function_varying_membership_redshift.csv',index=False)

@@ -23,6 +23,7 @@ def _fiducial_limits() -> pd.DataFrame:
 
 def main() -> None:
     import plate_magnitude_models as native
+    # adopted responses, then the withheld-star null
     native.native_variant("effective", set())
     native.native_null()
 

@@ -24,6 +24,7 @@ QVC_HALF_WINDOW = 30.0
 QVC_MIN_NEIGHBORS = 8
 QVC_SIGMA = 4.0
 
+# bin-edge check, 7,300 observed days at z = 1 in the 10^3.5-10^3.75 d bin
 k = int(np.searchsorted(EDGES, 7300.0 / (1.0 + 1.0), side="right")) - 1
 if not (np.isclose(EDGES[k], 10**3.5) and np.isclose(EDGES[k + 1], 10**3.75)):
     raise AssertionError("rest-frame lag binning check failed")
@@ -52,6 +53,7 @@ def check_flags(path) -> None:
         raise SystemExit(f"unknown option {' '.join(bad)}")
 
 
+# one inverse-variance mean per night (busy nights can't dominate the pairs)
 def condense_nightly(df: pd.DataFrame) -> pd.DataFrame:
     if not np.isfinite(df["magerr"]).all() or (df["magerr"] <= 0).any():
         raise ValueError("non-positive or non-finite magerr in light curves")
@@ -77,6 +79,7 @@ def qvc_significance(nightly: pd.DataFrame) -> np.ndarray:
     df = nightly.sort_values(["OBJID", "band", "night"], kind="stable")
     m, e = df["mag"].to_numpy(), df["sig"].to_numpy()
     g = df.groupby(["OBJID", "band"], sort=False, observed=True).ngroup().to_numpy()
+    # group offset keeps each window inside one light curve
     key = df["night"].to_numpy(dtype=float) + g * 1e7
     lo = np.searchsorted(key, key - QVC_HALF_WINDOW, side="left")
     hi = np.searchsorted(key, key + QVC_HALF_WINDOW, side="right")
@@ -100,6 +103,7 @@ def qvc_mask(nightly: pd.DataFrame, threshold: float = QVC_SIGMA) -> np.ndarray:
     return qvc_significance(nightly) > threshold
 
 
+# nightly epochs with each pair's residual plate variance, in quasar chunks
 def clean_nightly(lc: pd.DataFrame) -> pd.DataFrame:
     ids = lc["OBJID"].unique()
     parts = []
@@ -111,6 +115,7 @@ def clean_nightly(lc: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(parts, ignore_index=True)
 
 
+# plate series of each epoch, by band and POSS-I flag
 FLOOR_SURVEY = {("g", False): "SERC-J/EJ", ("r", False): "SERC-R/AAO-R",
                 ("r", True): "POSSI-E(S)", ("i", False): "SERC-I"}
 PAIR_SURVEYS = ["CCD", "SERC-J/EJ", "SERC-R/AAO-R", "POSSI-E(S)", "SERC-I", "TechPan"]
@@ -151,6 +156,7 @@ def floor_variance(nightly: pd.DataFrame, col: str = "sf2_mag2") -> pd.DataFrame
 def group_pairs(key: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
     sizes = np.diff(np.r_[starts, len(key)])
+    # offset pairs (a, b) from every group longer than b, vectorized
     i, j = zip(*[(s + a, s + b) for a, b in combinations(range(int(sizes.max())), 2) for s in [starts[sizes > b]]])
     return np.concatenate(i), np.concatenate(j)
 
@@ -242,6 +248,7 @@ def ensemble_second_moment(acc: np.ndarray, method: SFMethod = "object_mean",
     w = np.ones_like(v) if weights is None else np.broadcast_to(weights, v.shape)
     if np.any(~np.isfinite(w) | (w < 0)):
         raise ValueError("object weights must be finite and nonnegative")
+    # object_mean (adopted), equal quasar weights (many-pair quasars can't dominate)
     if method == "pooled":
         w = w * acc[..., 0]
     elif method in ("object_median", "positive_median"):
@@ -278,6 +285,7 @@ def object_bootstrap(acc: np.ndarray, n_boot: int = N_COV_BOOT, seed: int = 42,
     den = np.where(np.isfinite(v), w, 0.0).reshape(len(acc), -1)
     num = np.nan_to_num(v * w, nan=0.0).reshape(len(acc), -1)
     out = np.full((n_boot, num.shape[1]), np.nan)
+    # resample whole quasars (pairs share epochs)
     for r in range(0, n_boot, 128):
         size = min(128, n_boot - r)
         ids = rng.integers(0, len(acc), (size, len(acc)))
@@ -294,6 +302,7 @@ def ledoit_wolf(X: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
     n, p = X.shape
     Xc = X - X.mean(axis=0)
     S = Xc.T @ Xc / n
+    # Ledoit & Wolf 2004 shrinkage toward a scaled identity (well-conditioned inverse)
     mu = np.trace(S) / p
     d2 = ((S - mu * np.eye(p)) ** 2).sum()
     b2 = min(((np.einsum("ni,nj->nij", Xc, Xc) - S) ** 2).sum() / n ** 2, d2)
@@ -318,6 +327,7 @@ def load_properties(objids: np.ndarray) -> pd.DataFrame:
     m = cat.merge(prop, on=["PLATE", "MJD", "FIBERID"], how="inner")
     if len(m) < 30000:
         raise ValueError(f"DR16Q property crossmatch returned only {len(m)} rows")
+    # physical ranges only
     m = m[(m["LOGMBH"] > 6) & (m["LOGMBH"] < 12) &
           (m["LOGLEDD_RATIO"] > -5) & (m["LOGLEDD_RATIO"] < 2)]
     return m.set_index("OBJID")[["LOGMBH", "LOGLEDD_RATIO"]].loc[lambda x: x.index.isin(objids)]

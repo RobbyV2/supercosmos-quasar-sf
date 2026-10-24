@@ -10,10 +10,13 @@ from plate_completeness import load_completeness_lightcurves
 
 ROOT = Path(__file__).resolve().parents[1]
 KINDS = ("all", "ccd_ccd", "plate_ccd", "ztf_ztf")
+# dm = later minus earlier (dm < 0 brightening)
 SIGNS = ("total", "brightening", "dimming")
 CACHE = esf.CACHE / "sampling"
 
 
+# signed pair values (DRW brightening and dimming SFs agree, Shen & Burke 2021)
+# dm^2 and noise weighted as in esf.accumulate (all pairs give the adopted SF)
 def pair_values(sub, redshift, edges=esf.EDGES):
     sub = sub.sort_values("time", kind="stable")
     t, mag, sig, vt = (sub[c].to_numpy(float) for c in ("time", "mag", "sig", "trunc_v"))
@@ -31,6 +34,7 @@ def pair_values(sub, redshift, edges=esf.EDGES):
     return bins, dm, w * dm ** 2, noise, kinds
 
 
+# per pair class and sign (selection biases epochs before and after it oppositely)
 def split_accumulator(bins, dm, dm2, noise, kinds, nb=esf.NB):
     out = np.zeros((len(kinds), 3, nb, 3))
     for k, keep in enumerate(kinds):
@@ -69,6 +73,7 @@ def asymmetry(moment):
 def signature(ids, n_draw):
     paths = [ROOT / esf.LC_PARQUET, ROOT / "data/detection_correction_components.parquet",
              ROOT / "data/plate_native_pair_variance.csv", ROOT / "data/plate_completeness_sample.parquet"]
+    # kernel source in the key (an edit rebuilds the chunks)
     source = "".join(inspect.getsource(f) for f in (pair_values, split_accumulator, draw_single_pairs,
                                                     *esf.KERNELS, load_completeness_lightcurves))
     stamp = [esf.digest(p) for p in paths]
@@ -82,6 +87,7 @@ def build_cache(sample, n_draw):
     usable = sample.loc[np.isfinite(sample.reference_mag), "OBJID"].unique()
     token = signature(ids, n_draw)
     CACHE.mkdir(parents=True, exist_ok=True)
+    # 1,000-quasar chunks, kept when the signature matches
     for start in range(0, len(ids), 1000):
         part = ids[start:start + 1000]
         path = CACHE / f"chunk_{start:05d}.npz"
@@ -89,10 +95,13 @@ def build_cache(sample, n_draw):
             with np.load(path) as f:
                 if str(f["signature"]) == token:
                     continue
+        # quasars without a CCD reference mag stay empty (no corrections)
         nt = esf.clean_nightly(load_completeness_lightcurves(part[np.isin(part, usable)]))
         index = {o: i for i, o in enumerate(part)}
+        # quasar, band, pair class, sign, bin, (count, dm^2, noise)
         acc = np.zeros((len(part), 2, len(KINDS), 3, esf.NB, 3))
         draws, draw_keys = [], []
+        # seed per chunk (a rebuilt chunk redraws the same pairs)
         rng = np.random.default_rng(928000 + start)
         for (oid, band), sub in nt.groupby(["OBJID", "band"], sort=False, observed=True):
             bi, qi = esf.BANDS.index(band), index[oid]
@@ -132,6 +141,7 @@ def paired_single_bootstrap(draws, acc, n_boot, seed):
     rng = np.random.default_rng(seed)
     moments = esf.object_second_moments(acc)
     out = np.full((n_boot, 2, acc.shape[-2]), np.nan)
+    # same quasar resample for both (difference from the pair choice alone)
     for b in range(n_boot):
         ids = rng.integers(0, len(acc), len(acc))
         selection = rng.integers(0, draws.shape[1], len(acc))
@@ -149,7 +159,10 @@ def analyze(cache, sample, n_boot):
     pct = lambda x, q: np.nanpercentile(x, q) if np.isfinite(x).any() else [np.nan] * len(q)
     for bi, band in enumerate(esf.BANDS):
         s = sample[sample.band.eq(band)].set_index("OBJID").reindex(ids)
+        # fiducial bins, g through 7,499 d and r through 13,335 d
         endpoint = 12 if band == "g" else 13
+        # beta across samples (selection can skew brightening against dimming)
+        # samples parent (any pair), selected (adopted cut), fiducial (every bin), plate_ccd_sdss (no cut)
         selected = s.adopted_keep.fillna(False).to_numpy(bool)
         fiducial = selected & (acc[:, bi, 0, 0, :endpoint + 1, 0] > 0).all(axis=1)
         parent = (acc[:, bi, 0, 0, :, 0] > 0).any(axis=1)
@@ -160,9 +173,11 @@ def analyze(cache, sample, n_boot):
         for name, mask in (("full_parent", parent), ("selected", selected), ("fiducial", fiducial),
                            ("plate_ccd_sdss", plate_sdss)):
             a, oid = acc[mask, bi], ids[mask]
+            # resample whole quasars (pairs share epochs)
             point = esf.ensemble_second_moment(a)
             bounds, reps = esf.object_bootstrap(a, n_boot=n_boot, seed=928 + bi)
             beta, breps = asymmetry(point), asymmetry(reps)
+            # common-sign beta from quasars with both signs
             both = (a[:, :, 1:, :, 0] > 0).all(axis=2)
             cbreps = asymmetry(esf.object_bootstrap(a, n_boot=n_boot, seed=928 + bi, weights=both[:, :, None])[1])
             covariance[f"{name}_{band}_second_moment"] = np.cov(reps.reshape(n_boot, -1), rowvar=False)
@@ -192,6 +207,7 @@ def analyze(cache, sample, n_boot):
                                     f"{sign}_sf_lo":amplitude(bounds)[0, ki, j, k],
                                     f"{sign}_sf_hi":amplitude(bounds)[2, ki, j, k]})
                     summaries.append(row)
+                # max |beta| / SD per lag region (one test for many bins)
                 for region, use in (("all_supported", np.ones(esf.NB, bool)),
                                     ("ccd_timescales", esf.CENTERS <= 1334),
                                     ("long_timescales", esf.CENTERS >= 2371)):
@@ -200,6 +216,7 @@ def analyze(cache, sample, n_boot):
                         support[endpoint + 1:] = False
                     tests.append(dict(sample=name, band=band, pair_class=kind, region=region,
                                       **joint_test(beta[ki], breps[:, ki], support & use)))
+            # fiducial must reproduce the adopted SF and membership
             if name == "fiducial":
                 covariance[f"fiducial_ids_{band}"] = oid
                 covariance[f"fiducial_acc_{band}"] = a[:, 0, 0, :endpoint + 1]
@@ -208,6 +225,7 @@ def analyze(cache, sample, n_boot):
                 np.testing.assert_allclose(amplitude(point[0, 0, :endpoint + 1]), expected.sf_mag, rtol=1e-10)
                 if len(oid) != int(expected.n_objects.iloc[0]):
                     raise AssertionError("fiducial membership differs from adopted sample")
+            # one plate-CCD pair per quasar and bin vs all pairs (epoch-choice scatter)
             if name in ("selected", "fiducial"):
                 keys = cache["draw_keys"]
                 take = (keys[:, 1] == band) & np.isin(keys[:, 0], oid)
@@ -223,6 +241,7 @@ def analyze(cache, sample, n_boot):
                     n = np.isfinite(one[:, 0, k]).sum()
                     if n < 20 or (name == "fiducial" and k > endpoint):
                         continue
+                    # scatter over pair draws against the quasar bootstrap error
                     curve = amplitude(single_mean[:, k])
                     low, median, high = np.nanpercentile(curve, [16, 50, 84])
                     primary = amplitude(point)[2, 0, k]
@@ -255,6 +274,7 @@ def main():
     sample["OBJID"] = sample.OBJID.astype(str)
     sdss = pd.read_parquet(ROOT / esf.LC_PARQUET, columns=["OBJID", "band"], filters=[("survey", "==", "sdss")])
     sample["sdss"] = pd.MultiIndex.from_frame(sample[["OBJID", "band"]]).isin(pd.MultiIndex.from_frame(sdss))
+    # 1,000 single-pair draws, 3,000 bootstrap replicates
     analyze(build_cache(sample, 1000), sample, 3000)
 
 
