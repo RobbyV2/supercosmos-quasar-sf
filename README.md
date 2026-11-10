@@ -14,13 +14,15 @@ python3.12 -m venv .venv && py=.venv/bin/python && $py -m pip install -r require
 
 Included:
 
-- `data/`: SDSS, SERC, POSS-I passbands; CALSPEC Vega; Vanden Berk composite; Roma-BZCAT; BOSZ and SDSS spectrum manifests; SuperCOSMOS `wu_qso.hdf5`, `survey_table.fits`; IRSA ZTF exposure metadata (`ztf.ztf_current_meta_sci`)
+- `data/`: SDSS, SERC, POSS-I passbands; CALSPEC Vega; Roma-BZCAT; qsogen SED terms of the quasar fits (`quasar_sdss_sed_terms.parquet`); BOSZ and SDSS spectrum manifests; SuperCOSMOS `wu_qso.hdf5`, `survey_table.fits`; IRSA ZTF exposure metadata (`ztf.ztf_current_meta_sci`)
+- `data/quasar_sdss_recovered_photometry.csv`: 1350 quasars with SDSS PSF fluxes (nanomaggies) replacing DR16Q photometry missing or inconsistent with the Stripe 82 light curve, from SDSS DR16 PhotoObjAll detections and MacLeod et al. 2012 nights
 - `data/plate_quasar_epochs.csv`: 25537 calibrated plate epochs, SDSS g/r system, DR16Q quasars less Roma-BZCAT blazars; columns `sdss_name ra dec band mjd mag magerr plate survey fiducial_g fiducial_r`
 - `data/plate_native_pair_variance.csv`: 91 signed residual calibration variances (mag^2) by native pair class and 0.5 mag bin, subtracted per pair by `floor_variance` in `src/ensemble_structure_function.py`; columns `native_a native_b band mag_lo mag_hi subset boundary_sigma_min n_pairs n_core n_stars class_id clip_center clip_limit residual_variance null_mean unclipped_null_mean null_star_mean training_floor_se null_star_se`
 
 Not included:
 
 - `data/S82/{Catalog,dr16s82_sdssLCRaw,dr16s82_ps1LCRaw,dr16s82_ZuberLCRaw}.parquet` (catalog, CCD light curves)
+- 39 rows of `data/quasar_sdss_recovered_photometry.csv` taken from single nights of `data/S82/dr16s82_sdssLCRaw.parquet`
 - `data/StandardStars.zip` (CCD standard stars), `unzip -d temp data/StandardStars.zip`
 
 ## Downloads
@@ -53,6 +55,7 @@ export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1  # single-thread BLAS; fixed sum
 set -eo pipefail  # stop at the first failure
 $py src/stellar_sed_calibration.py --build-passbands  # IIIa-F, Tech Pan + OG590 passbands from public PDFs
 $py src/stellar_sed_calibration.py; for m in --response-sensitivity --og590; do $py src/stellar_sed_calibration.py $m; done  # star SEDs, response checks
+$py src/sss_qsogen_offsets.py --fit-sdss  # quasar SED fits
 for m in --native-fit --native-quasars --native-noise --native-publish; do $py src/plate_magnitude_models.py $m --native-variant effective; done  # plate calibration
 $py src/assemble_lightcurves.py  # light curves
 $py src/plate_completeness.py  # completeness, samples
@@ -67,8 +70,7 @@ $py src/fit_structure_function.py --literature-choices  # literature comparison
 $py src/fit_structure_function.py --refit-object-first  # group SFs, rises
 $py src/sf_model_checks.py --group-trends  # group trends
 $py src/simulate_structure_function.py --aggregation-test; $py src/simulate_structure_function.py --excess-null  # DRW recovery, excess null
-for m in --native-sed-control --observed-sed-control; do $py src/sss_qsogen_offsets.py $m; done  # quasar SED controls
-$py src/plate_magnitude_models.py --native-sed-impact --native-variant effective  # SED sensitivity
+$py src/sss_qsogen_offsets.py --observed-sed-control  # quasar SED control
 ```
 
 ## License

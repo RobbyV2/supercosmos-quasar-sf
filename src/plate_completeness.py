@@ -236,6 +236,7 @@ def sample_tables(cat, stats, ref, opp):
                 for kind, limit in [("plate", limits[0]), ("all", min(limits))]]
         for name, margin, faint in cuts + [("all_nocut", np.nan, np.inf), ("all_lim050", np.nan, min(limits50)),
                                            ("all_cut_000", 0.0, min(limits)), ("all_lim095", np.nan, min(limits95))]:
+            faint = np.round(faint, 2)
             # primary-series footprint, z >= 0.5 (host light), 17.5 mag bright cut
             keep = inside & target & (mag >= BRIGHT_BOUND) & (mag <= faint)
             if name == ADOPTED_SELECTION[band]:

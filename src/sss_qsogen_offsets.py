@@ -1,16 +1,16 @@
 import sys
+from functools import lru_cache
 from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from astropy.table import Table
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT / "src"))
 
 from qsogen import model_colours as mc
-from assemble_lightcurves import ab_minus_vega, abmag, read_bandpass, vac_to_air
+from assemble_lightcurves import ab_minus_vega, read_bandpass, redshift, sed_terms, vac_to_air
 import ensemble_structure_function as esf
 
 SSS_FILTERS = {
@@ -28,35 +28,6 @@ for name, fname in SSS_FILTERS.items():
     mc.resparrs[name] = Tf
     mc.zeropoints[name + "_AB"] = 0.1088544752 * mc.simps(Tf / fine, fine)
 
-def _native_sed_row(args):
-    """Native terms of one quasar from the composite and from its qsogen fit
-
-    term = catalog SDSS g (B_J) or r (red series) minus native Vega magnitude
-    Returns one row per native band
-    """
-    from qsogen.qsosed import Quasar_sed
-    from stellar_sed_calibration import redden
-
-    p, bands, vega, wr, fr = args
-    obj, z, logl, intrinsic_ebv, fragal, foreground = p
-    model = Quasar_sed(z=z, LogL3000=logl, ebv=intrinsic_ebv, fragal=fragal)
-    spectra = [(wr * (1 + z), fr / (1 + z)), (model.wavred, model.flux)]
-    terms = []
-    for w, f in spectra:
-        # Milky Way reddening in the observed frame, air wavelengths as the passbands
-        use = (w >= 2000) & (w <= 33000)
-        w, f = w[use], f[use]
-        f = redden(w, f, foreground)
-        w = vac_to_air(w)
-        mags = {b: abmag(w, f, *bp) for b, bp in bands.items()}
-        # native Vega to catalog g or r (r 0.015 mag off AB)
-        terms.append([mags["g" if b == "bj" else "r_sdss"] - mags[b] + vega[b]
-                      - (0 if b == "bj" else .015) for b in ("bj", "r", "e", "tp")])
-    return [dict(OBJID=obj, native=b, z=z, ebv=foreground, composite=terms[0][j],
-                 qsogen=terms[1][j], delta_qsogen=terms[1][j] - terms[0][j])
-            for j, b in enumerate(("bj", "r", "e", "tp"))]
-
-
 def _native_control_bands():
     from stellar_sed_calibration import bj_response
 
@@ -67,30 +38,8 @@ def _native_control_bands():
     return bands, vega
 
 
-def native_sed_control():
-    # each quasar's own qsogen SED (Temple et al. 2021) against the composite term
-    epochs = pd.read_parquet(_ROOT / "data/plate_native_quasar_epochs.parquet", columns=["OBJID", "z"])
-    objects = epochs.drop_duplicates("OBJID").set_index("OBJID")
-    objects.index = objects.index.astype(str)
-    cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet").assign(
-        OBJID=lambda d: d.objectId.astype(str)).set_index("OBJID")
-    objects = objects.join(cat[["qg_LogL3000", "qg_ebv", "qg_fragal", "ebv"]]).dropna()
-    # E(B-V) times 0.86 (Schlafly & Finkbeiner 2011), as for the standard stars
-    objects["ebv"] *= .86
-    bands, vega = _native_control_bands()
-    composite = Table.read(_ROOT / "data/vandenberk_qso_composite_cds.txt", format="ascii.cds")
-    wr, fr = np.asarray(composite["Wave"], float), np.asarray(composite["FluxD"], float)
-    args = [(p, bands, vega, wr, fr) for p in objects.reset_index().itertuples(index=False, name=None)]
-    with Pool(8) as pool:
-        result = pool.map(_native_sed_row, args, chunksize=100)
-    result = pd.DataFrame([row for group in result for row in group])
-    result["valid"] = np.isfinite(result[["composite", "qsogen"]]).all(axis=1)
-    result.to_csv(_ROOT / "data/quasar_native_sed_control.csv", index=False)
-    print(result.groupby("native").delta_qsogen.quantile([.05, .5, .95]).to_string(), flush=True)
-
-
 def observed_sed_control(manifest_path=None, output=None):
-    """Native terms measured on archived SDSS spectra, beside the composite and qsogen terms"""
+    """Native terms measured on archived SDSS spectra, beside the adopted qsogen terms"""
     from astropy.io import fits
     from stellar_sed_calibration import _weights
 
@@ -100,10 +49,10 @@ def observed_sed_control(manifest_path=None, output=None):
     if "OBJID" not in manifest:
         keys = ["PLATE", "MJD", "FIBERID"]
         cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet", columns=[
-            *keys, "objectId", "Z_SYS", "IF_BOSS_SDSS", "sdss_g_qg", "sdss_r_qg"]).set_index(keys, verify_integrity=True)
-        cat = cat.assign(OBJID=cat.objectId.astype(str), color=cat.sdss_g_qg - cat.sdss_r_qg)
+            *keys, "objectId", "Z_SYS", "IF_BOSS_SDSS"]).set_index(keys, verify_integrity=True)
+        cat = cat.assign(OBJID=cat.objectId.astype(str))
         manifest = manifest.join(cat.loc[pd.MultiIndex.from_frame(manifest[keys])].reset_index(drop=True))
-    control = pd.read_csv(_ROOT / "data/quasar_native_sed_control.csv", dtype={"OBJID": str}).set_index(["OBJID", "native"])
+    adopted = sed_terms(manifest.OBJID.unique(), ["bj", "r", "e", "tp", "sdss_g", "sdss_r"])
     bands, vega = _native_control_bands()
     rows = []
     for p in manifest.itertuples(index=False):
@@ -125,7 +74,7 @@ def observed_sed_control(manifest_path=None, output=None):
             curves = [bands["g" if native == "bj" else "r_sdss"], bands[native]]
             covered = all(w.min() < bp[0].min() and w.max() > bp[0].max() for bp in curves)
             row = dict(OBJID=p.OBJID, native=native, file=p.file, MJD=p.MJD, PLATE=p.PLATE,
-                       FIBERID=p.FIBERID, instrument=p.IF_BOSS_SDSS, z=p.Z_SYS, color=p.color,
+                       FIBERID=p.FIBERID, instrument=p.IF_BOSS_SDSS, z=p.Z_SYS, color=adopted.at[p.OBJID, "sdss_g"] - adopted.at[p.OBJID, "sdss_r"],
                        zwarning=warning, full_coverage=covered, quality=False, **metadata)
             if covered:
                 weights = np.array([_weights(w, *bp) for bp in curves])
@@ -139,9 +88,7 @@ def observed_sed_control(manifest_path=None, output=None):
                 # formal ivar error for the 0.03 mag cut (no flux-calibration error)
                 jac = 2.5 / np.log(10) * (weights[1] / integrals[1] - weights[0] / integrals[0])
                 error = np.sqrt(np.sum(jac ** 2 * variance))
-                compared = control.loc[p.OBJID, native]
-                row.update(observed=delta, composite=compared.composite, qsogen=compared.qsogen,
-                           delta_observed=delta - compared.composite, delta_qsogen=compared.qsogen - compared.composite,
+                row.update(observed=delta, adopted=adopted.at[p.OBJID, native], delta_observed=delta - adopted.at[p.OBJID, native],
                            formal_error=error, invalid_weight=missing, max_gap_angstrom=gap,
                            quality=bool(warning == 0 and error < .03 and missing < .005 and gap < 20))
             rows.append(row)
@@ -151,9 +98,156 @@ def observed_sed_control(manifest_path=None, output=None):
     return result
 
 
+@lru_cache
+def _light_curve_fluxes():
+    from stellar_sed_calibration import ASINH_B
+
+    raw = pd.read_parquet(_ROOT / "data/S82/dr16s82_sdssLCRaw.parquet", columns=["objectId", "psMag", "psMagErr", "filterID"]).query("filterID < 5")
+    flux, error = psf_flux(raw.psMag, raw.psMagErr, ASINH_B[raw.filterID])
+    key = [raw.objectId, raw.filterID]
+    lc = pd.DataFrame(dict(flux=flux.groupby(key).median(), error=error.groupby(key).median(), n=flux.groupby(key).size()))
+    lc["scatter"] = 1.4826 * abs(flux - flux.groupby(key).transform("median")).groupby(key).median()
+    return lc[lc.n >= 5].unstack()
+
+
+def psf_flux(mag, error, b):
+    """Nanomaggies and their errors from SDSS asinh magnitudes (Lupton et al. 1999)"""
+    arg, scale = -mag * np.log(10) / 2.5 - np.log(b), 2e9 * b
+    return scale * np.sinh(arg), error * np.log(10) / 2.5 * scale * np.cosh(arg)
+
+
+def light_curve_valid(objects, flux, error, k=5.):
+    """SDSS bands whose PSF flux and error agree with the quasar's raw Stripe 82 light curve
+
+    Deblended children carry zero fluxes or inflated errors that no SDSS flag marks
+    Invalid beyond k robust scatters of the median flux or k times the median epoch error
+    Returns objects by ugriz, True without five light-curve epochs
+    """
+    lc = _light_curve_fluxes().reindex(objects)
+    median, scatter, epoch = (lc[c].to_numpy() for c in ("flux", "scatter", "error"))
+    with np.errstate(invalid="ignore"):
+        return ~((abs(flux - median) > k * np.hypot(scatter, epoch)) | (error > k * epoch))
+
+
+def sdss_photometry(recovered=True):
+    """SDSS PSF fluxes of every catalog quasar, one imaging epoch each
+
+    DR16Q fluxes (Lyke et al. 2020) valid against the light curve, else the recovered DR16 detection
+    Returns by OBJID
+        z, RA, DEC, foreground_ebv, source
+        flux_ and error_ per ugriz band in nanomaggies
+    """
+    from astropy.io import fits
+
+    cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet",
+                          columns=["objectId", "RA", "DEC", "PLATE", "MJD", "FIBERID", "Z_SYS", "Z_DR16Q"])
+    key = lambda d: np.asarray(d["PLATE"], "i8") * 10 ** 9 + np.asarray(d["MJD"], "i8") * 10 ** 4 + np.asarray(d["FIBERID"], "i8")
+    with fits.open(_ROOT / "data/dr16q_prop_May01_2024.fits", memmap=True) as h:
+        keys = key(h[1].data)
+        order = np.argsort(keys)
+        rows = order[np.searchsorted(keys[order], key(cat)).clip(max=len(keys) - 1)]
+        if not np.array_equal(keys[rows], key(cat)):
+            raise ValueError("Catalog quasar missing from the DR16Q table")
+        # EBV already 0.86 times SFD (Schlafly & Finkbeiner 2011)
+        ebv, flux, ivar = (np.array(h[k].data[c][rows], float) for k, c in ((1, "EBV"), (2, "PSFFLUX"), (2, "PSFFLUX_IVAR")))
+    names = [f"{k}_{b}" for k in ("flux", "error") for b in "ugriz"]
+    p = pd.DataFrame(dict(z=redshift(cat), RA=cat.RA.to_numpy(), DEC=cat.DEC.to_numpy(), foreground_ebv=ebv, source="DR16Q"),
+                     index=cat.objectId.rename("OBJID"))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        error = ivar ** -.5
+        bad = (flux == -9999) | ~(ivar > 0) | ~light_curve_valid(cat.objectId, flux, error)
+        p[names] = np.where(np.tile(bad, 2), np.nan, np.hstack([flux, error]))
+    if recovered:
+        r = pd.read_csv(_ROOT / "data/quasar_sdss_recovered_photometry.csv", dtype={"OBJID": str, "photoObjID": str}).set_index("OBJID")
+        p.loc[r.index, names] = r[names]
+        p.loc[r.index, "source"] = r.source.str.cat(r.photoObjID, " ", na_rep="").str.strip()
+    return p
+
+
+class SdssSedModel:
+    def __init__(self, z, foreground_ebv, grid_size=5001, extra=()):
+        from stellar_sed_calibration import _weights, redden
+
+        self.z = float(z)
+        self.bands = {f"sdss_{b}": read_bandpass(f"SLOAN_SDSS.{b}.dat") for b in "ugriz"}
+        self.bands.update({f"ps1_{b}": (mc.wavarrs[f"PS1_{b}"], mc.resparrs[f"PS1_{b}"]) for b in "griz"})
+        native, self.vega = _native_control_bands()
+        self.bands.update({b: native[b] for b in self.vega}, **dict(extra))
+        # rest-frame grid past the host normalization and every response
+        lower = min(890., min(w.min() for w, _ in self.bands.values()) / (1 + self.z) * .95)
+        self.wave = np.geomspace(lower, 30000., grid_size)
+        observed = self.wave * (1 + self.z)
+        self.keep = (observed >= 2000) & (observed <= 33000)
+        # Milky Way reddening once, on the model
+        self.screen = redden(observed[self.keep], np.ones(self.keep.sum()), float(foreground_ebv))
+        air = vac_to_air(observed[self.keep])
+        self.weights = np.array([_weights(air, w, t) for w, t in self.bands.values()]) * 1e9
+
+    # AB nanomaggies per response
+    def __call__(self, parameters):
+        from qsogen.qsosed import Quasar_sed
+
+        sed = Quasar_sed(z=self.z, wavlen=self.wave, **dict(zip(("LogL3000", "ebv", "fragal"), parameters)))
+        return self.weights @ (sed.flux[self.keep] * self.screen)
+
+    def terms(self, flux):
+        from stellar_sed_calibration import AB_OFFSET
+
+        # zero model flux leaves the term undefined
+        with np.errstate(invalid="ignore", divide="ignore"):
+            m = dict(zip(self.bands, 22.5 - 2.5 * np.log10(flux)))
+            # AB model magnitudes, AB SDSS minus PS1 as the CCD offsets
+            out = {k: m[k] for k in self.bands if k[:4] == "sdss"}
+            out.update({f"ps1_{b}": m[f"sdss_{b}"] - m[f"ps1_{b}"] for b in "griz"})
+            # native Vega to catalog g or r (Thanjavur et al. 2021 offsets from AB)
+            out.update({n: m[f"sdss_{b}"] - AB_OFFSET["ugriz".index(b)] - m[n] + self.vega[n] for n, b in zip(self.vega, "grrr")})
+        return out
+
+
+def _fit_sdss(row):
+    from scipy.optimize import least_squares
+    from stellar_sed_calibration import AB_OFFSET
+
+    # LogL3000, intrinsic E(B-V) (negative is bluer than the default continuum), host fraction
+    lo, hi = np.array([40., -.5, 0.]), np.array([48., 3., .99])
+    scale = 10 ** (-.4 * AB_OFFSET)
+    flux = np.array([row[f"flux_{b}"] for b in "ugriz"]) * scale
+    # 0.03 mag floor for the fixed line strengths and continuum shape of the model
+    error = np.hypot(np.array([row[f"error_{b}"] for b in "ugriz"]) * scale, .03 * np.log(10) / 2.5 * abs(flux))
+    # u only below z = 2.3, before it drops out (qsogen README)
+    use = np.isfinite(flux + error) & (np.arange(5) >= (row["z"] >= 2.3))
+    out = dict(OBJID=row["OBJID"], z=row["z"], source=row["source"], bands="".join(np.array(list("ugriz"))[use]), dof=int(use.sum()) - 3)
+    if out["dof"] < 1:
+        return dict(out, status="fewer than four valid SDSS bands")
+    model = SdssSedModel(row["z"], row["foreground_ebv"])
+    p0 = np.array([45., .02, .1])
+    f = model(p0)[:5][use]
+    norm = np.sum(f * flux[use] / error[use] ** 2) / np.sum((f / error[use]) ** 2)
+    if not norm > 0:
+        return dict(out, status="no positive SDSS flux")
+    p0[0] += np.log10(norm)
+    best = least_squares(lambda p: (model(p)[:5][use] - flux[use]) / error[use], np.clip(p0, lo + 1e-6, hi - 1e-6),
+                         bounds=(lo, hi), x_scale="jac")
+    edge = np.minimum(best.x - lo, hi - best.x) < 1e-3
+    flags = [name for name, hit in (("LogL3000 at bound", edge[0]), ("E(B-V) at bound", edge[1]),
+                                    ("host fraction unconstrained", best.x[2] >= .98)) if hit]
+    status = "; ".join(flags) or "converged" if best.success else best.message
+    return dict(out, status=status, **dict(zip(("LogL3000", "intrinsic_ebv", "fragal"), best.x)),
+                chi2=2 * best.cost, **model.terms(model(best.x)))
+
+
+def fit_sdss_photometry():
+    """qsogen fit (Temple et al. 2021) of each quasar's SDSS PSF fluxes, with the conversion terms of its best model"""
+    rows = sdss_photometry().reset_index().to_dict("records")
+    with Pool(8) as pool:
+        result = pd.DataFrame(pool.imap(_fit_sdss, rows, chunksize=20))
+    result.to_parquet(_ROOT / "data/quasar_sdss_sed_terms.parquet", index=False)
+    print(result.status.value_counts().to_string(), flush=True)
+
+
 if __name__ == "__main__":
     esf.check_flags(__file__)
-    if "--observed-sed-control" in sys.argv:
+    if "--fit-sdss" in sys.argv:
+        fit_sdss_photometry()
+    elif "--observed-sed-control" in sys.argv:
         observed_sed_control()
-    elif "--native-sed-control" in sys.argv:
-        native_sed_control()

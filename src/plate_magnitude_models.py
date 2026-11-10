@@ -10,7 +10,7 @@ import pandas as pd
 import assemble_lightcurves as al
 import ensemble_structure_function as esf
 import star_null_structure_function as sn
-from stellar_sed_calibration import SED_CHI2_MAX, bj_response
+from stellar_sed_calibration import SED_CHI2_MAX
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -258,10 +258,7 @@ def raw_quasars():
 
 
 def native_quasars():
-    from astropy.table import Table
-    from astropy.coordinates import SkyCoord
-    from dustmaps.sfd import SFDQuery
-    from stellar_sed_calibration import redden
+    if NATIVE_VARIANT!="effective":raise ValueError("Quasar SED terms use the effective responses")
     cache = NATIVE_BASE/"raw_quasars.parquet"
     if cache.exists():
         q = pd.read_parquet(cache)
@@ -284,48 +281,8 @@ def native_quasars():
         result=native_inverse(q.loc[idx,"SMAG"].to_numpy(),xi[loc],eta[loc],coefficients.loc[plate])
         for name,values in zip(("native_mag","response_derivative","supported"),result):
             q.loc[idx,name]=values
-    # Schlegel et al. 1998 dust, rescaled as for the stars (Schlafly & Finkbeiner 2011)
-    dust_path=NATIVE_BASE/"quasar_dust.csv"
-    if not dust_path.exists():
-        cat=pd.read_parquet(ROOT/"data/S82/Catalog.parquet")
-        ebv=SFDQuery(map_dir=str(ROOT/"data/sfd"))(SkyCoord(cat.RA,cat.DEC,unit="deg"))
-        pd.DataFrame(dict(OBJID=cat.objectId.astype(str),ra=cat.RA,dec=cat.DEC,
-                          ebv_sfd=ebv,ebv=.86*ebv,previous_catalog_ebv=cat.ebv)).to_csv(dust_path,index=False)
-    dust=pd.read_csv(dust_path).set_index("OBJID")
-    dust.index=dust.index.astype(str)
-    objects=q[["OBJID","z"]].drop_duplicates("OBJID").set_index("OBJID")
-    objects["ebv"] = dust.ebv.reindex(objects.index)
-    if objects.ebv.isna().any():
-        raise ValueError("Missing consistently scaled quasar foreground reddening")
-    # plate to SDSS with the redshifted Vanden Berk et al. 2001 composite
-    template=Table.read(ROOT/"data/vandenberk_qso_composite_cds.txt",format="ascii.cds")
-    wave,flux=np.asarray(template["Wave"],float),np.asarray(template["FluxD"],float)
-    bands={b:al.read_bandpass(name) for b,name in {"bj":"serc-j.txt","r":"serc-r.txt","e":"possi-e.txt","tp":"techpan_og590.txt","sdss_g":"SLOAN_SDSS.g.dat","sdss_r":"SLOAN_SDSS.r.dat"}.items()}
-    # same plate responses as the stars
-    if NATIVE_VARIANT == "energy":
-        for b in ("bj","r","e"):
-            w,t=bands[b]
-            bands[b]=(w,t/w)
-    if NATIVE_VARIANT == "effective":
-        bands["r"]=al.read_bandpass("iiiaf_og590.txt")
-        bands["bj"]=bj_response()
-    vega={b:al.ab_minus_vega(*bands[b]) for b in ("bj","r","e","tp")}
-    terms=[]
-    for obj,p in objects.iterrows():
-        w=wave*(1+p.z);use=(w>=2000)&(w<=33000)
-        w=w[use]
-        f=redden(w,flux[use]/(1+p.z),p.ebv)
-        w=al.vac_to_air(w)
-        mags={b:al.abmag(w,f,*bp) for b,bp in bands.items()}
-        # Vega plate mags to the SDSS scale (r 0.015 mag off AB)
-        terms.append(dict(OBJID=obj,ebv=p.ebv,
-                          bj=mags["sdss_g"]-mags["bj"]+vega["bj"],
-                          r=mags["sdss_r"]-mags["r"]+vega["r"]-.015,
-                          e=mags["sdss_r"]-mags["e"]+vega["e"]-.015,
-                          tp=mags["sdss_r"]-mags["tp"]+vega["tp"]-.015))
-    terms=pd.DataFrame(terms).set_index("OBJID")
-    terms.to_csv(NATIVE_WORK/"quasar_sed_terms.csv")
-    matched=terms.reindex(q.OBJID)
+    # plate to SDSS with each quasar's qsogen fit (Temple et al. 2021)
+    matched=al.sed_terms(q.OBJID,["bj","r","e","tp"])
     q["sed_term"] = np.select([q.native.eq(b) for b in ("bj","r","e","tp")],[matched[b].to_numpy() for b in ("bj","r","e","tp")],default=np.nan)
     # SDSS asinh mags as in the CCD light curves (Lupton et al. 1999)
     pogson=q.native_mag+q.sed_term
@@ -334,6 +291,7 @@ def native_quasars():
     q["supported"] = q.supported.astype(bool)&np.isfinite(q.mag)
     q.to_parquet(NATIVE_WORK/"quasar_epochs.parquet",index=False)
     print(q.groupby(["band","supported"]).size().to_string())
+    print(f"{int(q.sed_term.isna().sum())} epochs of {q.OBJID[q.sed_term.isna()].nunique()} quasars without a defined SED term, unsupported")
 
 
 def native_validation():
@@ -542,7 +500,7 @@ def native_publish():
     inputs=[ROOT/"src/plate_magnitude_models.py",ROOT/"src/stellar_sed_calibration.py",
         ROOT/"data/roe_stars.hdf5",ROOT/"data/wu_qso.hdf5",ROOT/"data/survey_table.fits",
         ROOT/"data/standard_star_sed.parquet",ROOT/"data/standard_star_sed_response.parquet",
-        ROOT/"data/vandenberk_qso_composite_cds.txt",
+        ROOT/"data/quasar_sdss_sed_terms.parquet",
         ROOT/"data/sfd/SFD_dust_4096_ngp.fits",ROOT/"data/sfd/SFD_dust_4096_sgp.fits"]
     inputs.extend(ROOT/"data"/p for p in ("serc-j.txt","possi-e.txt","techpan_og590.txt","iiiaf_og590.txt",
         "SLOAN_SDSS.g.dat","SLOAN_SDSS.r.dat","alpha_lyr_stis_012.fits"))
@@ -728,50 +686,6 @@ def native_floor_impact():
     print(result.groupby(["band","statistic"])[["floor_sigma","quasar_sigma","lag_null_shift"]].agg(["min","max"]).to_string())
 
 
-def native_sed_impact():
-    import plate_completeness as pc
-    import sf_model_checks as checks
-    selected=[q for q in checks.samples() if q[1]=="fiducial"]
-    ids=np.unique(np.concatenate([p.index.to_numpy(str) for _,_,_,p,_ in selected]))
-    nightly=esf.clean_nightly(pc.load_completeness_lightcurves(ids))
-    epochs=pd.read_parquet(ROOT/"data/plate_native_quasar_epochs.parquet")
-    epochs["OBJID"]=epochs.OBJID.astype(str)
-    epochs=epochs.set_index(["OBJID","band","PLATEID"])
-    rows=[];rng=np.random.default_rng(7818)
-    for source,column,flag in (("native","delta_qsogen","valid"),("observed","delta_observed","quality")):
-        control=pd.read_csv(ROOT/f"data/quasar_{source}_sed_control.csv")
-        control["OBJID"]=control.OBJID.astype(str)
-        control=control[control[flag]&np.isfinite(control[column])].set_index(["OBJID","native"])
-        for band,_,acc,prop,kernel in selected:
-            nb=acc.shape[1];valid=[];alternatives=[]
-            for k,obj in enumerate(prop.index.astype(str)):
-                g=nightly[nightly.OBJID.eq(obj)&nightly.band.eq(band)].copy()
-                q=epochs.reindex(pd.MultiIndex.from_arrays([g.loc[g.sss,"OBJID"],g.loc[g.sss,"band"],g.loc[g.sss,"plate"]]))
-                # plate mags with each quasar's own SED term instead of the composite
-                terms=control.reindex(pd.MultiIndex.from_arrays([q.index.get_level_values(0),q.native]))[column]
-                if terms.isna().any():continue
-                pogson=q.native_mag.to_numpy()+q.sed_term.to_numpy()+terms.to_numpy()
-                softening=9e-11 if band=="g" else 1.2e-10
-                g.loc[g.sss,"mag"]=-2.5/np.log(10)*(np.arcsinh(10**(-.4*pogson)/(2*softening))+np.log(softening))
-                # same pairs, only the SED term differs
-                alternative=esf.accumulate(g,np.array([obj]),prop.z,edges=esf.EDGES[:nb+1],bands=[band],resid=True)[0,0]
-                np.testing.assert_array_equal(alternative[:,0],acc[k,:,0])
-                valid.append(k);alternatives.append(esf.object_second_moments(alternative[None])[0])
-            if not valid:continue
-            base=esf.object_second_moments(acc[np.array(valid)]);alternative=np.array(alternatives)
-            point=np.sqrt(base.mean(axis=0));other=np.sqrt(alternative.mean(axis=0))
-            # paired quasar bootstrap (sample noise cancels in the difference)
-            w=rng.multinomial(len(valid),np.full(len(valid),1/len(valid)),size=800)
-            delta=np.sqrt(np.maximum(w@alternative/len(valid),0))-np.sqrt(np.maximum(w@base/len(valid),0))
-            bounds=np.percentile(delta,[16,84],axis=0)
-            for k in range(nb):
-                rows.append(dict(control=source,band=band,n_fiducial=len(prop),n_common=len(valid),lag_days=esf.CENTERS[k],
-                    composite_sf_mag=point[k],alternative_sf_mag=other[k],difference_mag=other[k]-point[k],
-                    difference_lo=bounds[0,k],difference_hi=bounds[1,k]))
-    result=pd.DataFrame(rows);result.to_csv(ROOT/"data/plate_native_sed_sensitivity.csv",index=False)
-    print(result.groupby(["control","band"]).agg(n_common=("n_common","first"),max_abs_difference=("difference_mag",lambda x:x.abs().max())).to_string())
-
-
 def native_variant(variant,adopted):
     global NATIVE_VARIANT,NATIVE_WORK
     if variant is None and adopted.intersection(sys.argv) and (ROOT/"data/plate_native_calibration.json").exists():
@@ -787,7 +701,7 @@ def native_variant(variant,adopted):
 if __name__ == "__main__":
     esf.check_flags(__file__)
     native_variant((sys.argv+[""])[sys.argv.index("--native-variant")+1] if "--native-variant" in sys.argv else None,
-                   {"--native-floor-impact","--native-sed-impact"})
+                   {"--native-floor-impact"})
     if "--native-fit" in sys.argv:
         native_calibration()
     elif "--native-quasars" in sys.argv:
@@ -800,5 +714,3 @@ if __name__ == "__main__":
         native_publish()
     elif "--native-floor-impact" in sys.argv:
         native_floor_impact()
-    elif "--native-sed-impact" in sys.argv:
-        native_sed_impact()

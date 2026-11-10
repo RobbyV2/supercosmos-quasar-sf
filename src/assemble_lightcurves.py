@@ -12,7 +12,6 @@ from astropy.time import Time
 from scipy.optimize import curve_fit
 from scipy.stats import norm
 import astropy.units as u
-from qsogen import model_colours as mc
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -55,20 +54,16 @@ def ab_minus_vega(wf, tf):
                 np.asarray(wf, dtype=float), np.asarray(tf, dtype=float))
 
 
-SDSS_PS1 = [tuple((np.asarray(mc.wavarrs[f"{s}_{b}"], float), np.asarray(mc.resparrs[f"{s}_{b}"], float))
-                  for s in ("SDSS", "PS1")) for b in "griz"]
+def sed_terms(objects, columns):
+   """Conversion terms from each quasar's qsogen fit to its SDSS photometry
 
-
-def composite_colors(z_vals, pairs):
-   tbl = Table.read(str(_ROOT / "data/vandenberk_qso_composite_cds.txt"), format="ascii.cds")
-   wr, fr = np.asarray(tbl["Wave"], float), np.asarray(tbl["FluxD"], float)
-   cache, out = {}, np.full((len(z_vals), len(pairs)), np.nan)
-   for k, z in enumerate(z_vals):
-      if z not in cache:
-         lam, fo = wr * (1 + z), fr / (1 + z)
-         cache[z] = [abmag(lam, fo, *a) - abmag(lam, fo, *b) for a, b in pairs]
-      out[k] = cache[z]
-   return out
+   Raises for a quasar without a fit
+   Returns the columns by OBJID, NaN where the model has no flux in a band
+   """
+   t = pd.read_parquet(_ROOT / "data/quasar_sdss_sed_terms.parquet", columns=list(dict.fromkeys(["OBJID", "LogL3000", *columns]))).set_index("OBJID").reindex(objects)
+   if t.LogL3000.isna().any():
+      raise ValueError(f"No qsogen fit for quasars {sorted(set(t.index[t.LogL3000.isna()]))}")
+   return t[columns].where(np.isfinite(t[columns]))
 
 
 filters = {"u": 0, "g": 1, "r": 2, "i": 3, "z": 4, "y": 5}
@@ -99,7 +94,7 @@ def concat_light_curves_df(
 ):
    """SDSS, PS1 and ZTF epochs of the catalog quasars on the SDSS system
 
-   PS1 and ZTF shifted by each quasar's SDSS-PS1 color, composite color if it has no fit
+   PS1 and ZTF shifted by the SDSS-PS1 color of each quasar's qsogen fit
    Returns long frame: objectId, band, time, mag, magerr, survey, shallow (ZTF rows)
    """
    data_dir = _ROOT / "data/S82"
@@ -125,23 +120,8 @@ def concat_light_curves_df(
    cat_keys["ps1objID"] = cat_keys["ps1objID"].astype("Int64")
 
    # shift PS1 and PS1-tied ZTF onto SDSS by qsogen color (Temple et al. 2021)
-   offset_wide = pd.DataFrame(
-       {
-           "objectId": cat_keys["objectId"].values,
-           "g": cat_keys["sdss_g_qg"].values - cat_keys["ps1_g_qg"].values,
-           "r": cat_keys["sdss_r_qg"].values - cat_keys["ps1_r_qg"].values,
-           "i": cat_keys["sdss_i_qg"].values - cat_keys["ps1_i_qg"].values,
-           "z": cat_keys["sdss_z_qg"].values - cat_keys["ps1_z_qg"].values,
-       }
-   )
-   griz = list("griz")
-   miss = offset_wide[griz].isna().any(axis=1)
-   comp = composite_colors(np.round(redshift(cat_keys[miss]), 3), SDSS_PS1)
-   offset_wide[griz] = offset_wide[griz].fillna(pd.DataFrame(comp, offset_wide.index[miss], griz))
-   print(f"composite SDSS-PS1 offsets for {int(miss.sum())} quasars without a qsogen fit")
-   offset_long = offset_wide.melt(id_vars=["objectId"], var_name="band", value_name="offset")
-   u_offsets = pd.DataFrame({"objectId": cat_keys["objectId"].values, "band": "u", "offset": 0.0})
-   offset_long = pd.concat([offset_long, u_offsets], ignore_index=True)
+   offset_long = (sed_terms(cat_keys["objectId"].astype(str), [f"ps1_{b}" for b in "griz"]).rename(columns=lambda c: c[-1])
+                  .rename_axis("objectId").reset_index().melt(id_vars=["objectId"], var_name="band", value_name="offset"))
 
    band_map = pd.DataFrame({"band": bands_sdss, "filterID": [filters[b] for b in bands_sdss]})
 
@@ -495,22 +475,20 @@ def shallow_epochs(obj: np.ndarray, band: np.ndarray, survey: np.ndarray, mag: n
 
 
 def ccd_reference_mags() -> pd.Series:
-   # qsogen catalog mags: deep, no epoch detection selection; raw SDSS median fills gaps
-   cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet",
-                         columns=["objectId"] + [f"sdss_{b}_qg" for b in CCD_BANDS])
-   cat["OBJID"] = cat["objectId"].astype(str)
-   qg = cat.set_index("OBJID")[[f"sdss_{b}_qg" for b in CCD_BANDS]]
+   # qsogen model mags: deep, no epoch detection selection
+   cat = pd.read_parquet(_ROOT / "data/S82/Catalog.parquet", columns=["objectId"])
+   raw = pd.read_parquet(_ROOT / "data/S82/dr16s82_sdssLCRaw.parquet", columns=["objectId", "filterID", "psMag"])
+   raw = raw[raw["objectId"].isin(cat["objectId"]) & raw["filterID"].isin([filters[b] for b in bands_sdss])]
+   qg = sed_terms(raw["objectId"].astype(str).unique(), [f"sdss_{b}" for b in CCD_BANDS])
    qg.columns = CCD_BANDS
    qg = qg.stack().rename("ref")
    qg.index = qg.index.set_names(["OBJID", "band"])
-   raw = pd.read_parquet(_ROOT / "data/S82/dr16s82_sdssLCRaw.parquet", columns=["objectId", "filterID", "psMag"])
-   raw = raw[raw["objectId"].isin(cat["objectId"]) & raw["filterID"].isin([filters[b] for b in bands_sdss])]
    sd = (raw["psMag"].astype(float).groupby([raw["objectId"].astype(str).rename("OBJID"),
                                              raw["filterID"].map({filters[b]: b for b in bands_sdss}).rename("band")])
          .median().rename("ref"))
    # tie qsogen to raw SDSS medians of bright, untruncated quasars
    z0 = float(np.nanmedian((sd - qg).dropna()[qg.reindex(sd.index) < CCD_BRIGHT]))
-   return (qg + z0).combine_first(sd)
+   return qg + z0
 
 
 def build_ccd_truncation(df_base: pd.DataFrame, ref: pd.Series,
